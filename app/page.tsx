@@ -1,67 +1,42 @@
-import { Card } from "@/types/card";
+import { Suspense } from "react";
+import { getCollection } from "./actions";
+import CollectionManager from "./collection-manager";
 
-async function getCollection(): Promise<Card[]> {
-  const response = await fetch(
-    `${process.env.BACKEND_URL}/collection`,
-    {
-      cache: "no-store",
-    }
-  );
-
-  if (!response.ok) {
-    throw new Error("Failed to retrieve collection");
-  }
-
-  return response.json();
-}
-
-export default async function Home() {
+async function CollectionPage() {
   const collection = await getCollection();
 
+  return <CollectionManager initialCollection={collection} />;
+}
+
+function CollectionLoading() {
   return (
-    <main>
-      <h1>My Magic Collection</h1>
-
-      <p>
-        {collection.length} unique card identities
-      </p>
-
-      {collection.length === 0 ? (
-        <p>Your collection is currently empty.</p>
-      ) : (
-        <div className="card-grid">
-          {collection.flatMap((card) =>
-            card.printings.map((printing) => (
-              <div
-                key={printing.id}
-                className="card-item"
-              >
-                {printing.image_uri && (
-                  <img
-                    src={printing.image_uri}
-                    alt={card.name}
-                  />
-                )}
-
-                <h2>{card.name}</h2>
-
-                <p>
-                  Set: {printing.set_code.toUpperCase()}
-                </p>
-
-                <p>
-                  Collector number:{" "}
-                  {printing.collector_number}
-                </p>
-
-                <p>
-                  Quantity: {printing.copies.length}
-                </p>
-              </div>
-            ))
-          )}
+    <main className="app-shell loading-shell" aria-label="Loading collection">
+      <header className="topbar">
+        <span className="brand">
+          <span className="brand-mark">V</span>
+          <span>VEXING BAUBLE</span>
+        </span>
+      </header>
+      <section className="hero">
+        <div>
+          <p className="eyebrow">THE BINDER</p>
+          <h1>Your collection,<br />beautifully gathered.</h1>
+          <p className="hero-description">Gathering your cards...</p>
         </div>
-      )}
+      </section>
+      <div className="loading-grid" aria-hidden="true">
+        {Array.from({ length: 5 }, (_, index) => (
+          <div className="loading-card" key={index} />
+        ))}
+      </div>
     </main>
+  );
+}
+
+export default function Home() {
+  return (
+    <Suspense fallback={<CollectionLoading />}>
+      <CollectionPage />
+    </Suspense>
   );
 }

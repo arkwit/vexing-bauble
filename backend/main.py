@@ -1,3 +1,4 @@
+import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Depends, HTTPException, Query
@@ -14,17 +15,47 @@ from schemas import (
     OwnedCopyCreate,
     OwnedCopyRead,
     OwnedCopyUpdate,
+    BulkCopyDelete,
+    BulkCopyUpdate,
     CardCollectionRead,
+    ManaBoxImportRequest,
 )
-from services.scryfall import search_cards, get_card_by_id
+from services.scryfall import (
+    get_card_by_id,
+    get_cards_by_ids,
+)
+from services.scryfall_catalog import (
+    get_catalog_status,
+    initialize_catalog_status,
+    mark_catalog_sync_starting,
+    sync_scryfall_catalog,
+)
+
+catalog_sync_task: asyncio.Task[None] | None = None
+
+
+def start_catalog_sync() -> dict:
+    global catalog_sync_task
+    if catalog_sync_task is None or catalog_sync_task.done():
+        mark_catalog_sync_starting()
+        catalog_sync_task = asyncio.create_task(sync_scryfall_catalog())
+    return get_catalog_status()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     create_db_and_tables()
+    if initialize_catalog_status():
+        start_catalog_sync()
 
     yield
 
+    if catalog_sync_task and not catalog_sync_task.done():
+        catalog_sync_task.cancel()
+        try:
+            await catalog_sync_task
+        except asyncio.CancelledError:
+            pass
 
 app = FastAPI(lifespan=lifespan)
 
@@ -150,6 +181,67 @@ def get_copy(copy_id: int, session: Session = Depends(get_session)):
     return copy
 
 
+@app.post("/copies/bulk-delete")
+def delete_copies(
+    request: BulkCopyDelete, session: Session = Depends(get_session)
+):
+    copy_ids = list(dict.fromkeys(request.copy_ids))
+    copies = session.exec(
+        select(OwnedCopy).where(OwnedCopy.id.in_(copy_ids))
+    ).all()
+
+    if len(copies) != len(copy_ids):
+        raise HTTPException(status_code=404, detail="One or more copies were not found.")
+
+    for copy in copies:
+        session.delete(copy)
+
+    session.commit()
+
+    return {"deleted": len(copies)}
+
+
+@app.put("/copies/bulk", response_model=list[OwnedCopyRead])
+def update_copies(
+    request: BulkCopyUpdate, session: Session = Depends(get_session)
+):
+    copy_ids = list(dict.fromkeys(request.copy_ids))
+    update_data = request.model_dump(
+        exclude={"copy_ids"}, exclude_unset=True
+    )
+    update_data = {
+        key: value for key, value in update_data.items() if value is not None
+    }
+
+    if not update_data:
+        raise HTTPException(
+            status_code=422, detail="Provide at least one field to update."
+        )
+
+    if any(isinstance(value, str) and not value.strip() for value in update_data.values()):
+        raise HTTPException(
+            status_code=422, detail="Updated fields cannot be empty."
+        )
+
+    copies = session.exec(
+        select(OwnedCopy).where(OwnedCopy.id.in_(copy_ids))
+    ).all()
+
+    if len(copies) != len(copy_ids):
+        raise HTTPException(status_code=404, detail="One or more copies were not found.")
+
+    for copy in copies:
+        for key, value in update_data.items():
+            setattr(copy, key, value)
+        session.add(copy)
+
+    session.commit()
+    for copy in copies:
+        session.refresh(copy)
+
+    return copies
+
+
 # Retrieve all physical copies of a printing
 @app.get("/printings/{printing_id}/copies", response_model=list[OwnedCopyRead])
 def get_printing_copies(
@@ -233,35 +325,128 @@ def delete_copy(copy_id: int, session: Session = Depends(get_session)):
     return {"message": "Copy successfully deleted."}
 
 
+@app.get("/scryfall/catalog/status")
+def scryfall_catalog_status():
+    return get_catalog_status()
+
+
+@app.post("/scryfall/catalog/sync", status_code=202)
+def retry_scryfall_catalog_sync():
+    return start_catalog_sync()
+
+
 @app.get("/scryfall/search")
-async def scryfall_search(q: str = Query(min_length=1, max_length=255)):
-
-    try:
-        results = await search_cards(q)
-
-        return results
-
-    except httpx.HTTPStatusError as error:
-
-        if error.response.status_code == 404:
-            return {"data": [], "total_cards": 0}
-
+def scryfall_search(
+    q: str = Query(min_length=2, max_length=255),
+    session: Session = Depends(get_session),
+):
+    status = get_catalog_status()
+    if status["status"] != "ready":
+        detail = status.get("error") or status.get("message")
         raise HTTPException(
-            status_code=502,
-            detail="Scryfall returned an unsuccessful response.",
+            status_code=503,
+            detail=f"Local card catalog is not ready. {detail}",
         )
 
-    except httpx.RequestError:
+    query = q.strip()
+    cards = session.exec(
+        select(Card)
+        .where(Card.name.ilike(f"%{query}%"))
+        .order_by(Card.name)
+        .limit(24)
+    ).all()
 
-        raise HTTPException(
-            status_code=502, detail="Could not connect to Scryfall."
+    return {
+        "data": [
+            {
+                "id": card.latest_scryfall_id or card.oracle_id,
+                "oracle_id": card.oracle_id,
+                "name": card.name,
+                "set": card.latest_set_code or "",
+                "set_name": card.latest_set_name or "",
+                "collector_number": card.latest_collector_number or "",
+                "rarity": card.latest_rarity or "",
+                "released_at": card.latest_released_at,
+                "finishes": [
+                    finish
+                    for finish in (card.latest_finishes or "").split(",")
+                    if finish
+                ],
+            }
+            for card in cards
+        ]
+    }
+
+
+@app.get("/scryfall/printings/{oracle_id}")
+def scryfall_printings(
+    oracle_id: str, session: Session = Depends(get_session)
+):
+    card = session.exec(
+        select(Card).where(Card.oracle_id == oracle_id)
+    ).first()
+    if card is None:
+        raise HTTPException(status_code=404, detail="Card not found.")
+
+    printings = session.exec(
+        select(Printing)
+        .where(Printing.card_id == card.id)
+        .order_by(
+            Printing.released_at.desc(),
+            Printing.set_code,
+            Printing.collector_number,
         )
+    ).all()
+
+    return {
+        "data": [
+            {
+                "id": printing.scryfall_id,
+                "oracle_id": card.oracle_id,
+                "name": card.name,
+                "set": printing.set_code,
+                "set_name": printing.set_name or printing.set_code.upper(),
+                "collector_number": printing.collector_number,
+                "rarity": printing.rarity or "",
+                "released_at": printing.released_at,
+                "finishes": [
+                    finish
+                    for finish in (printing.finish_options or "").split(",")
+                    if finish
+                ],
+                "image_uris": {
+                    size: uri
+                    for size, uri in (
+                        ("normal", printing.image_uri),
+                        ("small", printing.small_image_uri),
+                    )
+                    if uri
+                },
+                "lang": printing.language,
+            }
+            for printing in printings
+        ]
+    }
 
 
 @app.post("/scryfall/import/{scryfall_id}")
 async def import_scryfall_printing(
     scryfall_id: str, session: Session = Depends(get_session)
 ):
+    printing = session.exec(
+        select(Printing).where(Printing.scryfall_id == scryfall_id)
+    ).first()
+    if printing is not None:
+        card = session.get(Card, printing.card_id)
+        if card is None:
+            raise HTTPException(
+                status_code=500, detail="Printing has no card identity."
+            )
+        return {
+            "message": "Printing already exists.",
+            "card_id": card.id,
+            "printing": PrintingRead.model_validate(printing),
+        }
 
     # Step 1: Retrieve the printing from Scryfall
     try:
@@ -312,19 +497,7 @@ async def import_scryfall_printing(
         session.commit()
         session.refresh(card)
 
-    # Step 4: Check whether the printing already exists
-    printing = session.exec(
-        select(Printing).where(Printing.scryfall_id == scryfall_id)
-    ).first()
-
-    if printing is not None:
-        return {
-            "message": "Printing already exists.",
-            "card_id": card.id,
-            "printing": PrintingRead.model_validate(printing),
-        }
-
-    # Step 5: Extract image information
+    # Step 4: Extract image information
     image_uris = scryfall_card.get("image_uris", {})
 
     if not image_uris:
@@ -333,7 +506,7 @@ async def import_scryfall_printing(
         if faces:
             image_uris = faces[0].get("image_uris", {})
 
-    # Step 6: Create the printing
+    # Step 5: Create the printing
     printing = Printing(
         card_id=card.id,
         scryfall_id=scryfall_id,
@@ -341,6 +514,11 @@ async def import_scryfall_printing(
         collector_number=scryfall_card["collector_number"],
         rarity=scryfall_card.get("rarity"),
         image_uri=image_uris.get("normal"),
+        small_image_uri=image_uris.get("small"),
+        set_name=scryfall_card.get("set_name"),
+        released_at=scryfall_card.get("released_at"),
+        finish_options=",".join(scryfall_card.get("finishes") or []),
+        language=scryfall_card.get("lang"),
     )
 
     session.add(printing)
@@ -356,55 +534,29 @@ async def import_scryfall_printing(
 
 @app.get("/collection", response_model=list[CardCollectionRead])
 def get_collection(session: Session = Depends(get_session)):
-
-    # Retrieve all database records
-    cards = session.exec(select(Card)).all()
-    printings = session.exec(select(Printing)).all()
-    copies = session.exec(select(OwnedCopy)).all()
-
-    # Group copies by printing ID
-    copies_by_printing = {}
-
-    for copy in copies:
-        copies_by_printing.setdefault(copy.printing_id, []).append(copy)
-
-    # Group printings by card ID
-    printings_by_card = {}
-
-    for printing in printings:
-
-        printing_copies = copies_by_printing.get(printing.id, [])
-
-        # Only include printings that you actually own
-        if not printing_copies:
-            continue
-
-        printing_data = {
-            "id": printing.id,
-            "scryfall_id": printing.scryfall_id,
-            "set_code": printing.set_code,
-            "collector_number": printing.collector_number,
-            "rarity": printing.rarity,
-            "image_uri": printing.image_uri,
-            "copies": printing_copies,
-        }
-
-        printings_by_card.setdefault(printing.card_id, []).append(
-            printing_data
+    owned_rows = session.exec(
+        select(Card, Printing, OwnedCopy)
+        .join(Printing, Printing.card_id == Card.id)
+        .join(OwnedCopy, OwnedCopy.printing_id == Printing.id)
+        .order_by(
+            Card.name,
+            Printing.set_code,
+            Printing.collector_number,
+            OwnedCopy.id,
         )
+    ).all()
 
-    # Construct the final collection
-    collection = []
+    collection_by_card: dict[int, dict] = {}
+    printings_by_id: dict[int, dict] = {}
 
-    for card in cards:
+    for card, printing, copy in owned_rows:
+        if card.id is None or printing.id is None:
+            raise HTTPException(
+                status_code=500, detail="Collection record has no database ID."
+            )
 
-        card_printings = printings_by_card.get(card.id, [])
-
-        # Only include cards that you actually own
-        if not card_printings:
-            continue
-
-        collection.append(
+        card_data = collection_by_card.setdefault(
+            card.id,
             {
                 "id": card.id,
                 "oracle_id": card.oracle_id,
@@ -412,8 +564,175 @@ def get_collection(session: Session = Depends(get_session)):
                 "mana_cost": card.mana_cost,
                 "type_line": card.type_line,
                 "oracle_text": card.oracle_text,
-                "printings": card_printings,
+                "printings": [],
+            },
+        )
+        printing_data = printings_by_id.get(printing.id)
+        if printing_data is None:
+            printing_data = {
+                "id": printing.id,
+                "scryfall_id": printing.scryfall_id,
+                "set_code": printing.set_code,
+                "collector_number": printing.collector_number,
+                "rarity": printing.rarity,
+                "image_uri": printing.image_uri,
+                "copies": [],
             }
+            printings_by_id[printing.id] = printing_data
+            card_data["printings"].append(printing_data)
+        printing_data["copies"].append(copy)
+
+    return list(collection_by_card.values())
+
+
+@app.post("/collection/import")
+async def import_manabox_collection(
+    request: ManaBoxImportRequest, session: Session = Depends(get_session)
+):
+    scryfall_ids = list(
+        dict.fromkeys(printing.scryfall_id for printing in request.printings)
+    )
+
+    try:
+        scryfall_cards, _ = await get_cards_by_ids(scryfall_ids)
+    except httpx.HTTPStatusError as error:
+        status_code = error.response.status_code
+        if status_code == 429:
+            detail = "Scryfall rate-limited the bulk lookup. Wait a moment and retry."
+        else:
+            try:
+                response_data = error.response.json()
+            except ValueError:
+                response_data = {}
+
+            upstream_detail = (
+                response_data.get("details", "")
+                if isinstance(response_data, dict)
+                else ""
+            )
+            detail = f"Scryfall rejected the bulk lookup (HTTP {status_code})."
+            if upstream_detail:
+                detail = f"{detail} {upstream_detail}"
+
+        raise HTTPException(
+            status_code=502,
+            detail=detail,
+        )
+    except httpx.RequestError:
+        raise HTTPException(
+            status_code=502,
+            detail="Could not connect to Scryfall. Check the backend's internet connection and retry.",
         )
 
-    return collection
+    cards_by_scryfall_id = {
+        scryfall_card["id"]: scryfall_card for scryfall_card in scryfall_cards
+    }
+    missing_ids = [
+        scryfall_id
+        for scryfall_id in scryfall_ids
+        if scryfall_id not in cards_by_scryfall_id
+    ]
+
+    if missing_ids:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Scryfall could not find {len(missing_ids)} card IDs in the export. Check the Scryfall ID column and re-export the file.",
+        )
+
+    scryfall_by_oracle_id: dict[str, dict] = {}
+    for scryfall_card in scryfall_cards:
+        oracle_id = scryfall_card.get("oracle_id")
+        if not oracle_id:
+            raise HTTPException(
+                status_code=422,
+                detail=f"{scryfall_card['name']} has no Oracle ID and cannot be imported.",
+            )
+        scryfall_by_oracle_id[oracle_id] = scryfall_card
+
+    oracle_ids = list(scryfall_by_oracle_id)
+    cards_by_oracle_id = {
+        card.oracle_id: card
+        for card in session.exec(
+            select(Card).where(Card.oracle_id.in_(oracle_ids))
+        ).all()
+    }
+
+    for oracle_id, scryfall_card in scryfall_by_oracle_id.items():
+        if oracle_id not in cards_by_oracle_id:
+            card = Card(
+                oracle_id=oracle_id,
+                name=scryfall_card["name"],
+                mana_cost=scryfall_card.get("mana_cost"),
+                type_line=scryfall_card.get("type_line"),
+                oracle_text=scryfall_card.get("oracle_text"),
+            )
+            session.add(card)
+            session.flush()
+            cards_by_oracle_id[oracle_id] = card
+
+    printings_by_scryfall_id = {
+        printing.scryfall_id: printing
+        for printing in session.exec(
+            select(Printing).where(Printing.scryfall_id.in_(scryfall_ids))
+        ).all()
+    }
+    new_printings = []
+
+    for scryfall_id, scryfall_card in cards_by_scryfall_id.items():
+        if scryfall_id in printings_by_scryfall_id:
+            continue
+
+        oracle_id = scryfall_card["oracle_id"]
+        card = cards_by_oracle_id[oracle_id]
+        if card.id is None:
+            raise HTTPException(status_code=500, detail="Could not create card identity.")
+
+        image_uris = scryfall_card.get("image_uris") or {}
+        if not image_uris:
+            faces = scryfall_card.get("card_faces", [])
+            if faces:
+                image_uris = faces[0].get("image_uris") or {}
+
+        printing = Printing(
+            card_id=card.id,
+            scryfall_id=scryfall_id,
+            set_code=scryfall_card["set"],
+            collector_number=scryfall_card["collector_number"],
+            rarity=scryfall_card.get("rarity"),
+            image_uri=image_uris.get("normal"),
+            small_image_uri=image_uris.get("small"),
+            set_name=scryfall_card.get("set_name"),
+            released_at=scryfall_card.get("released_at"),
+            finish_options=",".join(scryfall_card.get("finishes") or []),
+            language=scryfall_card.get("lang"),
+        )
+        session.add(printing)
+        new_printings.append(printing)
+
+    session.flush()
+    for printing in new_printings:
+        printings_by_scryfall_id[printing.scryfall_id] = printing
+
+    new_copies = []
+    for import_printing in request.printings:
+        printing = printings_by_scryfall_id[import_printing.scryfall_id]
+        if printing.id is None:
+            raise HTTPException(
+                status_code=500, detail="Could not create card printing."
+            )
+
+        for copy_data in import_printing.copies:
+            copy_values = copy_data.model_dump(exclude={"quantity"})
+            new_copies.extend(
+                OwnedCopy(printing_id=printing.id, **copy_values)
+                for _ in range(copy_data.quantity)
+            )
+
+    session.add_all(new_copies)
+    session.commit()
+
+    return {
+        "message": "ManaBox collection imported.",
+        "printings": len(scryfall_ids),
+        "copies": len(new_copies),
+    }

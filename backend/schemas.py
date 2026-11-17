@@ -40,14 +40,30 @@ class PrintingRead(SQLModel):
     image_uri: str | None = None
 
 
-class OwnedCopyCreate(SQLModel):
-    printing_id: int
+class OwnedCopyDetails(SQLModel):
     condition: str
     finish: str
     language: str = "English"
     purchase_price: Decimal | None = None
     purchase_date: date | None = None
     notes: str | None = None
+
+
+class OwnedCopyCreate(OwnedCopyDetails):
+    printing_id: int
+
+
+class ManaBoxCopyImport(OwnedCopyDetails):
+    quantity: int = Field(default=1, ge=1)
+
+
+class ManaBoxPrintingImport(SQLModel):
+    scryfall_id: str
+    copies: list[ManaBoxCopyImport] = Field(min_length=1)
+
+
+class ManaBoxImportRequest(SQLModel):
+    printings: list[ManaBoxPrintingImport] = Field(min_length=1)
 
 
 class OwnedCopyRead(SQLModel):
@@ -68,6 +84,17 @@ class OwnedCopyUpdate(SQLModel):
     purchase_price: Decimal | None = None
     purchase_date: date | None = None
     notes: str | None = None
+
+
+class BulkCopyUpdate(SQLModel):
+    copy_ids: list[int] = Field(min_length=1)
+    condition: str | None = None
+    finish: str | None = None
+    language: str | None = None
+
+
+class BulkCopyDelete(SQLModel):
+    copy_ids: list[int] = Field(min_length=1)
 
 
 class PrintingCollectionRead(SQLModel):
