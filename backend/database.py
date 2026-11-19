@@ -24,6 +24,20 @@ def create_db_and_tables():
             "finish_options": "TEXT",
             "language": "TEXT",
             "small_image_uri": "TEXT",
+            "art_crop_uri": "TEXT",
+            "eur_price": "NUMERIC",
+            "eur_foil_price": "NUMERIC",
+            "eur_etched_price": "NUMERIC",
+        },
+        "scryfallcatalogstate": {
+            "price_data_version": "INTEGER NOT NULL DEFAULT 0",
+        },
+        "ownedcopy": {
+            "binder_id": "INTEGER REFERENCES binder(id)",
+        },
+        "binder": {
+            "color": "TEXT NOT NULL DEFAULT '#5b9465'",
+            "cover_printing_id": "INTEGER REFERENCES printing(id)",
         },
     }
 
@@ -46,8 +60,49 @@ def create_db_and_tables():
             "CREATE INDEX IF NOT EXISTS ix_card_name ON card (name)"
         )
         connection.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS ix_card_name_nocase "
+            "ON card (name COLLATE NOCASE)"
+        )
+        connection.exec_driver_sql(
             "CREATE INDEX IF NOT EXISTS ix_printing_card_released "
             "ON printing (card_id, released_at)"
+        )
+        connection.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS ix_ownedcopy_binder_id "
+            "ON ownedcopy (binder_id)"
+        )
+
+        search_index_exists = connection.exec_driver_sql(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'card_name_search'"
+        ).first() is not None
+        connection.exec_driver_sql(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS card_name_search USING "
+            "fts5(name, content='card', content_rowid='id', tokenize='trigram')"
+        )
+        if not search_index_exists:
+            connection.exec_driver_sql(
+                "INSERT INTO card_name_search(card_name_search) VALUES ('rebuild')"
+            )
+        connection.exec_driver_sql(
+            "CREATE TRIGGER IF NOT EXISTS card_name_search_insert "
+            "AFTER INSERT ON card BEGIN "
+            "INSERT INTO card_name_search(rowid, name) "
+            "VALUES (new.id, new.name); END"
+        )
+        connection.exec_driver_sql(
+            "CREATE TRIGGER IF NOT EXISTS card_name_search_delete "
+            "AFTER DELETE ON card BEGIN "
+            "INSERT INTO card_name_search(card_name_search, rowid, name) "
+            "VALUES ('delete', old.id, old.name); END"
+        )
+        connection.exec_driver_sql(
+            "CREATE TRIGGER IF NOT EXISTS card_name_search_update "
+            "AFTER UPDATE OF name ON card BEGIN "
+            "INSERT INTO card_name_search(card_name_search, rowid, name) "
+            "VALUES ('delete', old.id, old.name); "
+            "INSERT INTO card_name_search(rowid, name) "
+            "VALUES (new.id, new.name); END"
         )
 
 

@@ -31,21 +31,36 @@ class Printing(SQLModel, table=True):
     rarity: str | None = None
     image_uri: str | None = None
     small_image_uri: str | None = None
+    art_crop_uri: str | None = None
     set_name: str | None = None
     released_at: str | None = None
     finish_options: str | None = None
     language: str | None = None
+    eur_price: Decimal | None = None
+    eur_foil_price: Decimal | None = None
+    eur_etched_price: Decimal | None = None
 
 
 class ScryfallCatalogState(SQLModel, table=True):
     id: int = Field(default=1, primary_key=True)
     bulk_updated_at: str
+    price_data_version: int = 0
+
+
+class Binder(SQLModel, table=True):
+    id: int | None = Field(default=None, primary_key=True)
+    name: str = Field(index=True, unique=True, max_length=80)
+    color: str = "#5b9465"
+    cover_printing_id: int | None = Field(
+        default=None, foreign_key="printing.id"
+    )
 
 
 class OwnedCopy(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
 
     printing_id: int = Field(foreign_key="printing.id")
+    binder_id: int | None = Field(default=None, foreign_key="binder.id", index=True)
 
     condition: str
     finish: str

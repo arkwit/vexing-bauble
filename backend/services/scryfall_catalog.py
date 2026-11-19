@@ -11,6 +11,7 @@ from sqlmodel import Session, func, select
 
 from database import engine
 from models import Card, Printing, ScryfallCatalogState
+from services.pricing import PRICE_DATA_VERSION, euro_prices_from_scryfall
 
 BASE_URL = "https://api.scryfall.com"
 HEADERS = {"User-Agent": "Vexing-Bauble/0.1", "Accept": "application/json"}
@@ -176,8 +177,11 @@ def _upsert_catalog_batch(card_data_batch: list[dict[str, Any]]) -> None:
             printing.rarity = card_data.get("rarity")
             printing.image_uri = _image_uri(card_data)
             printing.small_image_uri = _image_uri(card_data, "small")
+            printing.art_crop_uri = _image_uri(card_data, "art_crop")
             printing.finish_options = ",".join(card_data.get("finishes") or [])
             printing.language = card_data.get("lang")
+            for field, value in euro_prices_from_scryfall(card_data).items():
+                setattr(printing, field, value)
             session.add(printing)
 
         session.commit()
@@ -233,6 +237,7 @@ async def sync_scryfall_catalog() -> None:
             if (
                 saved_state
                 and saved_state.bulk_updated_at == bulk_updated_at
+                and saved_state.price_data_version >= PRICE_DATA_VERSION
                 and card_count > 0
             ):
                 _set_catalog_status(
@@ -293,10 +298,13 @@ async def sync_scryfall_catalog() -> None:
                 state = session.get(ScryfallCatalogState, 1)
                 if state is None:
                     state = ScryfallCatalogState(
-                        id=1, bulk_updated_at=bulk_updated_at
+                        id=1,
+                        bulk_updated_at=bulk_updated_at,
+                        price_data_version=PRICE_DATA_VERSION,
                     )
                 else:
                     state.bulk_updated_at = bulk_updated_at
+                    state.price_data_version = PRICE_DATA_VERSION
                 session.add(state)
                 session.commit()
                 card_count = session.exec(

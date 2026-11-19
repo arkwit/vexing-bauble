@@ -2,12 +2,16 @@ import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Depends, HTTPException, Query
-from sqlmodel import Session, select
+from sqlalchemy import text
+from sqlmodel import Session, func, select
 import httpx
 
 from database import create_db_and_tables, get_session
-from models import Card, Printing, OwnedCopy
+from models import Binder, Card, Printing, OwnedCopy
 from schemas import (
+    BinderCreate,
+    BinderRead,
+    BinderUpdate,
     CardCreate,
     CardRead,
     PrintingCreate,
@@ -30,6 +34,7 @@ from services.scryfall_catalog import (
     mark_catalog_sync_starting,
     sync_scryfall_catalog,
 )
+from services.pricing import current_euro_price, euro_prices_from_scryfall
 
 catalog_sync_task: asyncio.Task[None] | None = None
 
@@ -40,6 +45,74 @@ def start_catalog_sync() -> dict:
         mark_catalog_sync_starting()
         catalog_sync_task = asyncio.create_task(sync_scryfall_catalog())
     return get_catalog_status()
+
+
+def validate_binder_id(session: Session, binder_id: int | None) -> None:
+    if binder_id is not None and session.get(Binder, binder_id) is None:
+        raise HTTPException(status_code=404, detail="Binder not found.")
+
+
+def normalize_binder_name(
+    session: Session, name: str, exclude_binder_id: int | None = None
+) -> str:
+    normalized_name = name.strip()
+    if not normalized_name:
+        raise HTTPException(status_code=422, detail="Binder name cannot be empty.")
+
+    existing_binder = session.exec(
+        select(Binder).where(func.lower(Binder.name) == normalized_name.lower())
+    ).first()
+    if existing_binder and existing_binder.id != exclude_binder_id:
+        raise HTTPException(
+            status_code=409, detail="A binder with that name already exists."
+        )
+
+    return normalized_name
+
+
+def get_art_crop_uri(printing: Printing) -> str | None:
+    if printing.art_crop_uri:
+        return printing.art_crop_uri
+    if printing.image_uri and "/normal/" in printing.image_uri:
+        return printing.image_uri.replace("/normal/", "/art_crop/", 1)
+    return None
+
+
+def validate_cover_printing_id(
+    session: Session, printing_id: int | None
+) -> None:
+    if printing_id is not None and session.get(Printing, printing_id) is None:
+        raise HTTPException(status_code=404, detail="Cover printing not found.")
+
+
+def serialize_binder(session: Session, binder: Binder) -> BinderRead:
+    cover_printing = (
+        session.get(Printing, binder.cover_printing_id)
+        if binder.cover_printing_id is not None
+        else None
+    )
+    cover_card = (
+        session.get(Card, cover_printing.card_id)
+        if cover_printing is not None
+        else None
+    )
+    if binder.id is None:
+        raise HTTPException(status_code=500, detail="Binder has no database ID.")
+
+    return BinderRead(
+        id=binder.id,
+        name=binder.name,
+        color=binder.color,
+        cover_printing_id=binder.cover_printing_id,
+        cover_image_uri=get_art_crop_uri(cover_printing)
+        if cover_printing is not None
+        else None,
+        cover_card_name=cover_card.name if cover_card is not None else None,
+        cover_set_code=cover_printing.set_code if cover_printing is not None else None,
+        cover_collector_number=(
+            cover_printing.collector_number if cover_printing is not None else None
+        ),
+    )
 
 
 @asynccontextmanager
@@ -69,6 +142,68 @@ def root():
 @app.get("/health")
 def health():
     return {"status": "running"}
+
+
+@app.get("/binders", response_model=list[BinderRead])
+def get_binders(session: Session = Depends(get_session)):
+    binders = session.exec(select(Binder).order_by(Binder.name)).all()
+    return [serialize_binder(session, binder) for binder in binders]
+
+
+@app.post("/binders", response_model=BinderRead, status_code=201)
+def create_binder(
+    binder_data: BinderCreate, session: Session = Depends(get_session)
+):
+    validate_cover_printing_id(session, binder_data.cover_printing_id)
+    binder = Binder(
+        name=normalize_binder_name(session, binder_data.name),
+        color=binder_data.color,
+        cover_printing_id=binder_data.cover_printing_id,
+    )
+    session.add(binder)
+    session.commit()
+    session.refresh(binder)
+    return serialize_binder(session, binder)
+
+
+@app.put("/binders/{binder_id}", response_model=BinderRead)
+def update_binder(
+    binder_id: int,
+    binder_data: BinderUpdate,
+    session: Session = Depends(get_session),
+):
+    binder = session.get(Binder, binder_id)
+    if binder is None:
+        raise HTTPException(status_code=404, detail="Binder not found.")
+
+    validate_cover_printing_id(session, binder_data.cover_printing_id)
+    binder.name = normalize_binder_name(
+        session, binder_data.name, exclude_binder_id=binder_id
+    )
+    binder.color = binder_data.color
+    binder.cover_printing_id = binder_data.cover_printing_id
+    session.add(binder)
+    session.commit()
+    session.refresh(binder)
+    return serialize_binder(session, binder)
+
+
+@app.delete("/binders/{binder_id}")
+def delete_binder(binder_id: int, session: Session = Depends(get_session)):
+    binder = session.get(Binder, binder_id)
+    if binder is None:
+        raise HTTPException(status_code=404, detail="Binder not found.")
+
+    copies = session.exec(
+        select(OwnedCopy).where(OwnedCopy.binder_id == binder_id)
+    ).all()
+    for copy in copies:
+        copy.binder_id = None
+        session.add(copy)
+
+    session.delete(binder)
+    session.commit()
+    return {"message": "Binder deleted; its copies are now unassigned."}
 
 
 @app.get("/cards", response_model=list[CardRead])
@@ -210,7 +345,9 @@ def update_copies(
         exclude={"copy_ids"}, exclude_unset=True
     )
     update_data = {
-        key: value for key, value in update_data.items() if value is not None
+        key: value
+        for key, value in update_data.items()
+        if value is not None or key == "binder_id"
     }
 
     if not update_data:
@@ -222,6 +359,9 @@ def update_copies(
         raise HTTPException(
             status_code=422, detail="Updated fields cannot be empty."
         )
+
+    if "binder_id" in update_data:
+        validate_binder_id(session, update_data["binder_id"])
 
     copies = session.exec(
         select(OwnedCopy).where(OwnedCopy.id.in_(copy_ids))
@@ -276,7 +416,13 @@ def create_copy(
             status_code=400, detail="Printing ID does not match the URL."
         )
 
-    new_copy = OwnedCopy(**copy_data.model_dump())
+    validate_binder_id(session, copy_data.binder_id)
+    copy_values = copy_data.model_dump()
+    if copy_values["purchase_price"] is None:
+        copy_values["purchase_price"] = current_euro_price(
+            printing, copy_data.finish
+        )
+    new_copy = OwnedCopy(**copy_values)
 
     session.add(new_copy)
     session.commit()
@@ -298,7 +444,9 @@ def update_copy(
     if existing_copy is None:
         raise HTTPException(status_code=404, detail="Copy not found.")
 
-    update_data = copy_data.model_dump()
+    update_data = copy_data.model_dump(exclude_unset=True)
+    if "binder_id" in update_data:
+        validate_binder_id(session, update_data["binder_id"])
 
     for key, value in update_data.items():
         setattr(existing_copy, key, value)
@@ -349,11 +497,36 @@ def scryfall_search(
         )
 
     query = q.strip()
+    if len(query) < 2:
+        raise HTTPException(
+            status_code=422,
+            detail="Enter at least two characters to search.",
+        )
+
+    if len(query) < 3:
+        escaped_query = (
+            query.replace("\\", "\\\\")
+            .replace("%", "\\%")
+            .replace("_", "\\_")
+        )
+        matching_cards = select(Card).where(
+            Card.name.collate("NOCASE").like(
+                f"{escaped_query}%", escape="\\"
+            )
+        )
+    else:
+        escaped_query = query.replace('"', '""')
+        match_query = f'"{escaped_query}"'
+        matching_card_ids = (
+            select(text("rowid"))
+            .select_from(text("card_name_search"))
+            .where(text("card_name_search MATCH :match_query"))
+            .params(match_query=match_query)
+        )
+        matching_cards = select(Card).where(Card.id.in_(matching_card_ids))
+
     cards = session.exec(
-        select(Card)
-        .where(Card.name.ilike(f"%{query}%"))
-        .order_by(Card.name)
-        .limit(24)
+        matching_cards.order_by(Card.name).limit(24)
     ).all()
 
     return {
@@ -401,6 +574,7 @@ def scryfall_printings(
     return {
         "data": [
             {
+                "printing_id": printing.id,
                 "id": printing.scryfall_id,
                 "oracle_id": card.oracle_id,
                 "name": card.name,
@@ -419,8 +593,14 @@ def scryfall_printings(
                     for size, uri in (
                         ("normal", printing.image_uri),
                         ("small", printing.small_image_uri),
+                        ("art_crop", get_art_crop_uri(printing)),
                     )
                     if uri
+                },
+                "prices": {
+                    "eur": printing.eur_price,
+                    "eur_foil": printing.eur_foil_price,
+                    "eur_etched": printing.eur_etched_price,
                 },
                 "lang": printing.language,
             }
@@ -515,10 +695,12 @@ async def import_scryfall_printing(
         rarity=scryfall_card.get("rarity"),
         image_uri=image_uris.get("normal"),
         small_image_uri=image_uris.get("small"),
+        art_crop_uri=image_uris.get("art_crop"),
         set_name=scryfall_card.get("set_name"),
         released_at=scryfall_card.get("released_at"),
         finish_options=",".join(scryfall_card.get("finishes") or []),
         language=scryfall_card.get("lang"),
+        **euro_prices_from_scryfall(scryfall_card),
     )
 
     session.add(printing)
@@ -576,6 +758,9 @@ def get_collection(session: Session = Depends(get_session)):
                 "collector_number": printing.collector_number,
                 "rarity": printing.rarity,
                 "image_uri": printing.image_uri,
+                "eur_price": printing.eur_price,
+                "eur_foil_price": printing.eur_foil_price,
+                "eur_etched_price": printing.eur_etched_price,
                 "copies": [],
             }
             printings_by_id[printing.id] = printing_data
@@ -679,35 +864,41 @@ async def import_manabox_collection(
     new_printings = []
 
     for scryfall_id, scryfall_card in cards_by_scryfall_id.items():
-        if scryfall_id in printings_by_scryfall_id:
-            continue
+        printing = printings_by_scryfall_id.get(scryfall_id)
+        if printing is None:
+            oracle_id = scryfall_card["oracle_id"]
+            card = cards_by_oracle_id[oracle_id]
+            if card.id is None:
+                raise HTTPException(
+                    status_code=500,
+                    detail="Could not create card identity.",
+                )
 
-        oracle_id = scryfall_card["oracle_id"]
-        card = cards_by_oracle_id[oracle_id]
-        if card.id is None:
-            raise HTTPException(status_code=500, detail="Could not create card identity.")
+            image_uris = scryfall_card.get("image_uris") or {}
+            if not image_uris:
+                faces = scryfall_card.get("card_faces", [])
+                if faces:
+                    image_uris = faces[0].get("image_uris") or {}
 
-        image_uris = scryfall_card.get("image_uris") or {}
-        if not image_uris:
-            faces = scryfall_card.get("card_faces", [])
-            if faces:
-                image_uris = faces[0].get("image_uris") or {}
+            printing = Printing(
+                card_id=card.id,
+                scryfall_id=scryfall_id,
+                set_code=scryfall_card["set"],
+                collector_number=scryfall_card["collector_number"],
+                rarity=scryfall_card.get("rarity"),
+                image_uri=image_uris.get("normal"),
+                small_image_uri=image_uris.get("small"),
+                art_crop_uri=image_uris.get("art_crop"),
+                set_name=scryfall_card.get("set_name"),
+                released_at=scryfall_card.get("released_at"),
+                finish_options=",".join(scryfall_card.get("finishes") or []),
+                language=scryfall_card.get("lang"),
+            )
+            new_printings.append(printing)
 
-        printing = Printing(
-            card_id=card.id,
-            scryfall_id=scryfall_id,
-            set_code=scryfall_card["set"],
-            collector_number=scryfall_card["collector_number"],
-            rarity=scryfall_card.get("rarity"),
-            image_uri=image_uris.get("normal"),
-            small_image_uri=image_uris.get("small"),
-            set_name=scryfall_card.get("set_name"),
-            released_at=scryfall_card.get("released_at"),
-            finish_options=",".join(scryfall_card.get("finishes") or []),
-            language=scryfall_card.get("lang"),
-        )
+        for field, value in euro_prices_from_scryfall(scryfall_card).items():
+            setattr(printing, field, value)
         session.add(printing)
-        new_printings.append(printing)
 
     session.flush()
     for printing in new_printings:
@@ -722,7 +913,12 @@ async def import_manabox_collection(
             )
 
         for copy_data in import_printing.copies:
+            validate_binder_id(session, copy_data.binder_id)
             copy_values = copy_data.model_dump(exclude={"quantity"})
+            if copy_values["purchase_price"] is None:
+                copy_values["purchase_price"] = current_euro_price(
+                    printing, copy_data.finish
+                )
             new_copies.extend(
                 OwnedCopy(printing_id=printing.id, **copy_values)
                 for _ in range(copy_data.quantity)
