@@ -1,4 +1,5 @@
 export interface ScryfallCard {
+  printing_id?: number;
   id: string;
   oracle_id?: string;
   name: string;
@@ -14,6 +15,12 @@ export interface ScryfallCard {
   image_uris?: {
     normal?: string;
     small?: string;
+    art_crop?: string;
+  };
+  prices?: {
+    eur?: string | null;
+    eur_foil?: string | null;
+    eur_etched?: string | null;
   };
   card_faces?: {
     image_uris?: {

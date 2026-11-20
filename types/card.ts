@@ -2,6 +2,7 @@
 export interface OwnedCopy {
   id: number;
   printing_id: number;
+  binder_id: number | null;
   condition: string;
   finish: string;
   language: string;
@@ -17,6 +18,10 @@ export interface Printing {
   collector_number: string;
   rarity: string | null;
   image_uri: string | null;
+  art_crop_uri?: string | null;
+  eur_price: number | string | null;
+  eur_foil_price: number | string | null;
+  eur_etched_price: number | string | null;
   copies: OwnedCopy[];
 }
 

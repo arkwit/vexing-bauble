@@ -4,7 +4,25 @@ import type { Card, OwnedCopy, Printing } from "@/types/card";
 import type { ScryfallCard } from "@/types/scryfall";
 import type { ManaBoxPrintingImport } from "./manabox-csv";
 
+export interface Binder {
+  id: number;
+  name: string;
+  color: string;
+  cover_printing_id: number | null;
+  cover_image_uri: string | null;
+  cover_card_name: string | null;
+  cover_set_code: string | null;
+  cover_collector_number: string | null;
+}
+
+export interface BinderInput {
+  name: string;
+  color: string;
+  cover_printing_id: number | null;
+}
+
 export interface BulkCopyUpdateInput {
+  binder_id?: number | null;
   condition?: string;
   finish?: string;
   language?: string;
@@ -122,6 +140,35 @@ export async function getCollection(): Promise<Card[]> {
   return backendFetch<Card[]>("/collection");
 }
 
+export async function getBinders(): Promise<Binder[]> {
+  return backendFetch<Binder[]>("/binders");
+}
+
+export async function createBinder(input: BinderInput): Promise<Binder> {
+  return backendFetch<Binder>("/binders", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+}
+
+export async function updateBinder(
+  binderId: number,
+  input: BinderInput
+): Promise<Binder> {
+  return backendFetch<Binder>(`/binders/${binderId}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+}
+
+export async function deleteBinder(binderId: number): Promise<void> {
+  await backendFetch<{ message: string }>(`/binders/${binderId}`, {
+    method: "DELETE",
+  });
+}
+
 export async function searchCardCatalog(
   query: string
 ): Promise<ScryfallCard[]> {
@@ -170,6 +217,7 @@ export interface OwnedCopyInput {
   condition: string;
   finish: string;
   language: string;
+  binder_id: number | null;
   purchase_price: string | null;
   purchase_date: string | null;
   notes: string | null;

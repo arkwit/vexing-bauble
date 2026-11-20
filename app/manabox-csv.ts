@@ -128,8 +128,19 @@ function parseDate(value: string) {
   }
 
   let normalized = value;
+  const isoDateTime =
+    /^(\d{4}-\d{2}-\d{2})(?:[Tt]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)?$/i.exec(
+      value
+    );
+  if (isoDateTime) {
+    normalized = isoDateTime[1];
+    if (/[Tt]/.test(value) && Number.isNaN(Date.parse(value))) {
+      return undefined;
+    }
+  }
+
   const usDate = /^(\d{1,2})\/(\d{1,2})\/(\d{4})$/.exec(value);
-  if (usDate) {
+  if (!isoDateTime && usDate) {
     normalized = `${usDate[3]}-${usDate[1].padStart(2, "0")}-${usDate[2].padStart(2, "0")}`;
   }
 
@@ -267,16 +278,42 @@ export function parseManaBoxCsv(content: string): ManaBoxParseResult {
       rowErrors.push("quantity must be a positive whole number");
     }
 
-    const priceValue = parsePrice(
-      readField(row, columns, "Purchase price", "Purchase price (USD)")
+    const priceText = readField(
+      row,
+      columns,
+      "Purchase price",
+      "Purchase price (USD)"
     );
+    const priceValue = parsePrice(priceText);
     if (priceValue === undefined) {
       rowErrors.push("purchase price is not a valid number");
     }
-
-    const purchaseDate = parseDate(
-      readField(row, columns, "Purchase date", "Date purchased")
+    const declaredPriceCurrency = readField(
+      row,
+      columns,
+      "Purchase price currency"
+    )
+      .trim()
+      .toUpperCase();
+    const priceColumnIsUsd = columns.has(
+      normalizeHeader("Purchase price (USD)")
     );
+    const priceCurrency =
+      priceColumnIsUsd ? "USD" : declaredPriceCurrency || "EUR";
+    if (
+      priceValue !== null &&
+      priceValue !== undefined &&
+      priceCurrency !== "EUR"
+    ) {
+      rowErrors.push(
+        `purchase price currency must be EUR (found ${priceCurrency})`
+      );
+    }
+
+    const purchaseDateValue =
+      readField(row, columns, "Purchase date", "Date purchased") ||
+      readField(row, columns, "Added");
+    const purchaseDate = parseDate(purchaseDateValue);
     if (purchaseDate === undefined) {
       rowErrors.push("purchase date must be YYYY-MM-DD or MM/DD/YYYY");
     }

@@ -2,9 +2,12 @@
 
 import Image from "next/image";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
+  createBinder,
   createOwnedCopy,
+  deleteBinder,
   deleteManyOwnedCopies,
   deleteOwnedCopy,
   getCardCatalogStatus,
@@ -14,8 +17,10 @@ import {
   importScryfallPrinting,
   searchCardCatalog,
   startCardCatalogSync,
+  updateBinder,
   updateManyOwnedCopies,
   updateOwnedCopy,
+  type Binder,
   type BulkCopyUpdateInput,
   type CardCatalogStatus,
   type OwnedCopyInput,
@@ -29,9 +34,12 @@ import {
 
 type CollectionManagerProps = {
   initialCollection: Card[];
+  initialBinders: Binder[];
+  initialBinderView: string;
 };
 
 type CopyDraft = {
+  binder_id: string;
   condition: string;
   finish: string;
   language: string;
@@ -41,11 +49,87 @@ type CopyDraft = {
 };
 
 type CopyDefaults = Pick<CopyDraft, "condition" | "finish" | "language">;
+type SortDirection = "asc" | "desc";
+type BinderDraft = {
+  name: string;
+  color: string;
+  cover_printing_id: number | null;
+  cover_image_uri: string | null;
+  cover_card_name: string | null;
+  cover_set_code: string | null;
+  cover_collector_number: string | null;
+};
+type EuroPrices = {
+  eur?: number | string | null;
+  eur_foil?: number | string | null;
+  eur_etched?: number | string | null;
+};
+type PrintingValuation = {
+  currentValue: number | null;
+  absoluteChange: number | null;
+  relativeChange: number | null;
+};
 
 type CollectionEntry = {
   card: Card;
   printing: Printing;
 };
+
+type PortfolioSegment = {
+  key: string;
+  label: string;
+  color: string;
+  copies: number;
+  value: number;
+  absoluteChange: number | null;
+  relativeChange: number | null;
+  unpricedCopies: number;
+  percentage: number;
+};
+
+type PortfolioTotals = {
+  copies: number;
+  value: number;
+  absoluteChange: number;
+  purchaseTotal: number;
+  comparableCopies: number;
+  unpricedCopies: number;
+};
+
+const defaultBinderColor = "#5b9465";
+const emptyBinderDraft: BinderDraft = {
+  name: "",
+  color: defaultBinderColor,
+  cover_printing_id: null,
+  cover_image_uri: null,
+  cover_card_name: null,
+  cover_set_code: null,
+  cover_collector_number: null,
+};
+
+function filterCollectionByBinder(collection: Card[], binderView: string) {
+  if (binderView === "all") {
+    return collection;
+  }
+
+  const binderId =
+    binderView === "unassigned"
+      ? null
+      : Number(binderView.slice("binder:".length));
+  if (binderView !== "unassigned" && !Number.isInteger(binderId)) {
+    return [];
+  }
+
+  return collection.flatMap((card) => {
+    const printings = card.printings.flatMap((printing) => {
+      const copies = printing.copies.filter(
+        (copy) => (copy.binder_id ?? null) === binderId
+      );
+      return copies.length > 0 ? [{ ...printing, copies }] : [];
+    });
+    return printings.length > 0 ? [{ ...card, printings }] : [];
+  });
+}
 
 const conditions = [
   "Near Mint",
@@ -63,6 +147,7 @@ const standardCopyDefaults: CopyDefaults = {
 };
 const emptyDraft: CopyDraft = {
   ...standardCopyDefaults,
+  binder_id: "",
   purchase_price: "",
   purchase_date: "",
   notes: "",
@@ -118,6 +203,215 @@ function getDefaultFinish(card: ScryfallCard, defaultFinish: string) {
     : getSuggestedFinish(card);
 }
 
+function getCurrentEuroPrice(finish: string, prices?: EuroPrices) {
+  const normalizedFinish = finish.trim().toLowerCase();
+  if (["paper", "proxy", "paper/proxy"].includes(normalizedFinish)) {
+    return 0;
+  }
+
+  const price =
+    normalizedFinish === "foil"
+      ? prices?.eur_foil
+      : normalizedFinish === "etched"
+        ? prices?.eur_etched
+        : prices?.eur;
+  if (price === null || price === undefined) {
+    return null;
+  }
+
+  const amount = Number(price);
+  return Number.isFinite(amount) ? amount : null;
+}
+
+function getScryfallCurrentEuroPrice(card: ScryfallCard, finish: string) {
+  return getCurrentEuroPrice(finish, card.prices);
+}
+
+function getPrintingValuation(printing: Printing): PrintingValuation {
+  const pricedCopies = printing.copies.flatMap((copy) => {
+    const currentPrice = getCurrentEuroPrice(copy.finish, {
+      eur: printing.eur_price,
+      eur_foil: printing.eur_foil_price,
+      eur_etched: printing.eur_etched_price,
+    });
+    if (currentPrice === null) {
+      return [];
+    }
+
+    const recordedPurchasePrice =
+      copy.purchase_price === null ? 0 : Number(copy.purchase_price);
+    return [
+      {
+        currentPrice,
+        purchasePrice: Number.isFinite(recordedPurchasePrice)
+          ? recordedPurchasePrice
+          : 0,
+        hasPurchasePrice: copy.purchase_price !== null,
+      },
+    ];
+  });
+
+  if (pricedCopies.length === 0) {
+    return {
+      currentValue: null,
+      absoluteChange: null,
+      relativeChange: null,
+    };
+  }
+
+  const currentTotal = pricedCopies.reduce(
+    (total, copy) => total + copy.currentPrice,
+    0
+  );
+  const purchaseTotal = pricedCopies.reduce(
+    (total, copy) => total + copy.purchasePrice,
+    0
+  );
+  const recordedPurchaseTotal = pricedCopies.reduce(
+    (total, copy) =>
+      total + (copy.hasPurchasePrice ? copy.purchasePrice : 0),
+    0
+  );
+  const changeTotal = currentTotal - purchaseTotal;
+
+  return {
+    currentValue: currentTotal / pricedCopies.length,
+    absoluteChange: changeTotal / pricedCopies.length,
+    relativeChange:
+      recordedPurchaseTotal > 0
+        ? (changeTotal / recordedPurchaseTotal) * 100
+        : null,
+  };
+}
+
+function getPortfolioValue(
+  collection: Card[],
+  binders: Binder[]
+): {
+  total: number;
+  totalCopies: number;
+  absoluteChange: number | null;
+  relativeChange: number | null;
+  unpricedCopies: number;
+  segments: PortfolioSegment[];
+} {
+  const createTotals = (): PortfolioTotals => ({
+    copies: 0,
+    value: 0,
+    absoluteChange: 0,
+    purchaseTotal: 0,
+    comparableCopies: 0,
+    unpricedCopies: 0,
+  });
+  const binderTotals = new Map<number, PortfolioTotals>();
+  const binderSegments = binders.map((binder) => {
+    const totals = createTotals();
+    binderTotals.set(binder.id, totals);
+    return {
+      key: `binder:${binder.id}`,
+      label: binder.name,
+      color: binder.color,
+      totals,
+    };
+  });
+  const unassignedTotals = createTotals();
+  let totalCopies = 0;
+  let total = 0;
+  let unpricedCopies = 0;
+
+  for (const card of collection) {
+    for (const printing of card.printings) {
+      for (const copy of printing.copies) {
+        const segment =
+          copy.binder_id === null
+            ? unassignedTotals
+            : (binderTotals.get(copy.binder_id) ?? unassignedTotals);
+        const value = getCurrentEuroPrice(copy.finish, {
+          eur: printing.eur_price,
+          eur_foil: printing.eur_foil_price,
+          eur_etched: printing.eur_etched_price,
+        });
+
+        totalCopies += 1;
+        segment.copies += 1;
+        if (value === null) {
+          unpricedCopies += 1;
+          segment.unpricedCopies += 1;
+          continue;
+        }
+
+        total += value;
+        segment.value += value;
+        if (copy.purchase_price === null) {
+          continue;
+        }
+
+        const purchasePrice = Number(copy.purchase_price);
+        if (!Number.isFinite(purchasePrice)) {
+          continue;
+        }
+        segment.absoluteChange += value - purchasePrice;
+        segment.purchaseTotal += purchasePrice;
+        segment.comparableCopies += 1;
+      }
+    }
+  }
+
+  const totals = [...binderTotals.values(), unassignedTotals];
+  const comparableCopies = totals.reduce(
+    (count, segment) => count + segment.comparableCopies,
+    0
+  );
+  const absoluteChange =
+    comparableCopies > 0
+      ? totals.reduce((change, segment) => change + segment.absoluteChange, 0)
+      : null;
+  const purchaseTotal = totals.reduce(
+    (value, segment) => value + segment.purchaseTotal,
+    0
+  );
+  const segments = [
+    ...binderSegments.map(({ key, label, color, totals: segmentTotals }) => ({
+      key,
+      label,
+      color,
+      ...segmentTotals,
+    })),
+    {
+      key: "unassigned",
+      label: "Unassigned",
+      color: "#66736a",
+      ...unassignedTotals,
+    },
+  ].map((segment) => ({
+    key: segment.key,
+    label: segment.label,
+    color: segment.color,
+    copies: segment.copies,
+    value: segment.value,
+    absoluteChange:
+      segment.comparableCopies > 0 ? segment.absoluteChange : null,
+    relativeChange:
+      segment.purchaseTotal > 0
+        ? (segment.absoluteChange / segment.purchaseTotal) * 100
+        : null,
+    unpricedCopies: segment.unpricedCopies,
+    percentage: total > 0 ? (segment.value / total) * 100 : 0,
+  }));
+
+  return {
+    total,
+    totalCopies,
+    absoluteChange,
+    relativeChange:
+      purchaseTotal > 0 && absoluteChange !== null
+        ? (absoluteChange / purchaseTotal) * 100
+        : null,
+    unpricedCopies,
+    segments,
+  };
+}
+
 function getTodayLocalDate() {
   const today = new Date();
   const month = String(today.getMonth() + 1).padStart(2, "0");
@@ -125,9 +419,14 @@ function getTodayLocalDate() {
   return `${today.getFullYear()}-${month}-${day}`;
 }
 
-function createCopyDraft(defaults: CopyDefaults, finish = defaults.finish): CopyDraft {
+function createCopyDraft(
+  defaults: CopyDefaults,
+  finish = defaults.finish,
+  binderId = ""
+): CopyDraft {
   return {
     ...defaults,
+    binder_id: binderId,
     finish,
     purchase_price: "",
     purchase_date: getTodayLocalDate(),
@@ -181,6 +480,7 @@ function toCopyInput(draft: CopyDraft): OwnedCopyInput {
     condition: draft.condition,
     finish: draft.finish,
     language: draft.language,
+    binder_id: draft.binder_id ? Number(draft.binder_id) : null,
     purchase_price: draft.purchase_price.trim() || null,
     purchase_date: draft.purchase_date || null,
     notes: draft.notes.trim() || null,
@@ -192,10 +492,36 @@ function getCopyDraft(copy: OwnedCopy): CopyDraft {
     condition: copy.condition,
     finish: copy.finish,
     language: copy.language,
+    binder_id: copy.binder_id?.toString() ?? "",
     purchase_price: copy.purchase_price?.toString() ?? "",
     purchase_date: copy.purchase_date ?? "",
     notes: copy.notes ?? "",
   };
+}
+
+function getLatestPurchaseDate(copies: OwnedCopy[]) {
+  return copies.reduce<string | null>(
+    (latest, copy) =>
+      copy.purchase_date &&
+      (!latest || copy.purchase_date > latest)
+        ? copy.purchase_date
+        : latest,
+    null
+  );
+}
+
+function getAveragePurchasePrice(copies: OwnedCopy[]) {
+  const prices = copies
+    .map((copy) =>
+      copy.purchase_price === null ? null : Number(copy.purchase_price)
+    )
+    .filter((price): price is number => price !== null && Number.isFinite(price));
+
+  if (prices.length === 0) {
+    return null;
+  }
+
+  return prices.reduce((total, price) => total + price, 0) / prices.length;
 }
 
 function formatCurrency(value: string | number | null) {
@@ -207,9 +533,62 @@ function formatCurrency(value: string | number | null) {
   return Number.isFinite(amount)
     ? new Intl.NumberFormat(undefined, {
         style: "currency",
-        currency: "USD",
+        currency: "EUR",
       }).format(amount)
     : null;
+}
+
+function formatEuroAmount(value: number | null) {
+  return value === null
+    ? null
+    : `${new Intl.NumberFormat(undefined, {
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2,
+      }).format(value)} €`;
+}
+
+function formatPortfolioChange(
+  absoluteChange: number | null,
+  relativeChange: number | null
+) {
+  if (absoluteChange === null) {
+    return "Purchase value not recorded";
+  }
+
+  const amount = formatEuroAmount(Math.abs(absoluteChange)) ?? "0.00 €";
+  const sign = absoluteChange > 0 ? "+" : absoluteChange < 0 ? "-" : "";
+  const percentage =
+    relativeChange === null
+      ? " (n/a)"
+      : ` (${relativeChange > 0 ? "+" : ""}${relativeChange.toFixed(1)}%)`;
+
+  return `${sign}${amount}${percentage}`;
+}
+
+function getPortfolioChangeClass(absoluteChange: number | null) {
+  if (absoluteChange === null || absoluteChange === 0) {
+    return "is-neutral";
+  }
+  return absoluteChange > 0 ? "is-positive" : "is-negative";
+}
+
+function formatPriceChange(value: number | null) {
+  if (value === null) {
+    return null;
+  }
+  const formatted = formatEuroAmount(Math.abs(value));
+  const sign = value > 0 ? "+" : value < 0 ? "-" : "";
+  return formatted ? `${sign}${formatted}` : null;
+}
+
+function formatPercentChange(value: number | null) {
+  if (value === null) {
+    return null;
+  }
+  const formatted = new Intl.NumberFormat(undefined, {
+    maximumFractionDigits: 1,
+  }).format(value);
+  return `${value > 0 ? "+" : ""}${formatted}%`;
 }
 
 function getForeignLanguages(copies: OwnedCopy[]) {
@@ -246,9 +625,11 @@ function getLanguageLabel(language: string) {
 function CopyFields({
   draft,
   onChange,
+  binders,
 }: {
   draft: CopyDraft;
   onChange: (draft: CopyDraft) => void;
+  binders: Binder[];
 }) {
   function update<K extends keyof CopyDraft>(key: K, value: CopyDraft[K]) {
     onChange({ ...draft, [key]: value });
@@ -289,9 +670,23 @@ function CopyFields({
           />
         </label>
         <label className="field">
-          <span>Purchase price</span>
+          <span>Binder</span>
+          <select
+            value={draft.binder_id}
+            onChange={(event) => update("binder_id", event.target.value)}
+          >
+            <option value="">Unassigned</option>
+            {binders.map((binder) => (
+              <option key={binder.id} value={binder.id}>
+                {binder.name}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="field">
+          <span>Purchase price (EUR)</span>
           <div className="input-prefix">
-            <span>$</span>
+            <span>€</span>
             <input
               type="number"
               min="0"
@@ -324,16 +719,64 @@ function CopyFields({
   );
 }
 
+function BinderCoverPreview({ binder }: { binder: BinderDraft }) {
+  const printingLabel = [
+    binder.cover_set_code?.toUpperCase(),
+    binder.cover_collector_number
+      ? `#${binder.cover_collector_number}`
+      : null,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+
+  return (
+    <div
+      className="binder-cover-preview"
+      style={{ borderColor: binder.color }}
+    >
+      <div
+        className="binder-cover-art"
+        style={{ backgroundColor: `${binder.color}30` }}
+      >
+        {binder.cover_image_uri ? (
+          <Image
+            src={binder.cover_image_uri}
+            alt=""
+            width={600}
+            height={220}
+            unoptimized
+          />
+        ) : (
+          <span>No cover artwork selected</span>
+        )}
+      </div>
+      <div className="binder-cover-caption">
+        <strong>{binder.cover_card_name ?? "Binder cover"}</strong>
+        <span>{printingLabel || "Choose a printing to set the cover"}</span>
+      </div>
+    </div>
+  );
+}
+
 export default function CollectionManager({
   initialCollection,
+  initialBinders,
+  initialBinderView,
 }: CollectionManagerProps) {
+  const router = useRouter();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const searchRequestRef = useRef(0);
   const printingsRequestRef = useRef(0);
+  const binderImageRequestRef = useRef(0);
+  const catalogRefreshStartedRef = useRef(false);
   const [collection, setCollection] = useState(initialCollection);
+  const [binders, setBinders] = useState(initialBinders);
+  const selectedBinderView = initialBinderView;
+  const [binderDashboardQuery, setBinderDashboardQuery] = useState("");
   const [searchFilter, setSearchFilter] = useState("");
   const [selectedSet, setSelectedSet] = useState("all");
   const [sortBy, setSortBy] = useState("name");
+  const [sortDirection, setSortDirection] = useState<SortDirection>("asc");
   const [selectedPrintingIds, setSelectedPrintingIds] = useState<number[]>([]);
   const [selectionMode, setSelectionMode] = useState(false);
   const [isAddOpen, setIsAddOpen] = useState(false);
@@ -352,7 +795,31 @@ export default function CollectionManager({
   const [bulkCondition, setBulkCondition] = useState("");
   const [bulkFinish, setBulkFinish] = useState("");
   const [bulkLanguage, setBulkLanguage] = useState("");
+  const [bulkBinder, setBulkBinder] = useState("unchanged");
   const [bulkError, setBulkError] = useState("");
+  const [binderManagerOpen, setBinderManagerOpen] = useState(false);
+  const [newBinderDraft, setNewBinderDraft] =
+    useState<BinderDraft>(emptyBinderDraft);
+  const [editingBinderId, setEditingBinderId] = useState<number | null>(null);
+  const [editingBinderDraft, setEditingBinderDraft] =
+    useState<BinderDraft>(emptyBinderDraft);
+  const [binderError, setBinderError] = useState("");
+  const [binderBusy, setBinderBusy] = useState(false);
+  const [binderCoverPickerOpen, setBinderCoverPickerOpen] = useState(false);
+  const [binderCoverTarget, setBinderCoverTarget] = useState<
+    "new" | number | null
+  >(null);
+  const [binderImageQuery, setBinderImageQuery] = useState("");
+  const [binderImageResults, setBinderImageResults] = useState<ScryfallCard[]>(
+    []
+  );
+  const [binderImageCard, setBinderImageCard] =
+    useState<ScryfallCard | null>(null);
+  const [binderImagePrintings, setBinderImagePrintings] = useState<
+    ScryfallCard[]
+  >([]);
+  const [binderImageLoading, setBinderImageLoading] = useState(false);
+  const [binderImageError, setBinderImageError] = useState("");
   const [searchQuery, setSearchQuery] = useState("");
   const [catalogStatus, setCatalogStatus] =
     useState<CardCatalogStatus | null>(null);
@@ -367,6 +834,7 @@ export default function CollectionManager({
   const [searchError, setSearchError] = useState("");
   const [searching, setSearching] = useState(false);
   const [addDraft, setAddDraft] = useState<CopyDraft>(emptyDraft);
+  const [autoPurchasePrice, setAutoPurchasePrice] = useState(false);
   const [activeEntry, setActiveEntry] = useState<CollectionEntry | null>(null);
   const [editingCopyId, setEditingCopyId] = useState<number | null>(null);
   const [editDraft, setEditDraft] = useState<CopyDraft>(emptyDraft);
@@ -387,6 +855,24 @@ export default function CollectionManager({
         }
 
         setCatalogStatus(status);
+        if (status.refreshing) {
+          catalogRefreshStartedRef.current = true;
+        } else if (
+          catalogRefreshStartedRef.current &&
+          status.status === "ready"
+        ) {
+          catalogRefreshStartedRef.current = false;
+          try {
+            const refreshedCollection = await getCollection();
+            if (active) {
+              setCollection(refreshedCollection);
+            }
+          } catch (error) {
+            if (active) {
+              setPageError(getErrorMessage(error));
+            }
+          }
+        }
         if (
           ["checking", "downloading", "indexing"].includes(status.status) ||
           status.refreshing
@@ -453,19 +939,56 @@ export default function CollectionManager({
     };
   }, [isAddOpen, searchQuery, catalogStatus?.status]);
 
-  const totalCopies = collection.reduce(
-    (total, card) =>
-      total +
-      card.printings.reduce(
-        (printingTotal, printing) => printingTotal + printing.copies.length,
-        0
-      ),
-    0
+  const portfolio = useMemo(
+    () => getPortfolioValue(collection, binders),
+    [collection, binders]
   );
-  const totalPrintings = collection.reduce(
-    (total, card) => total + card.printings.length,
-    0
+  const portfolioSegmentsByKey = useMemo(
+    () => new Map(portfolio.segments.map((segment) => [segment.key, segment])),
+    [portfolio.segments]
   );
+  const portfolioGradient = useMemo(() => {
+    let start = 0;
+    const stops = portfolio.segments.flatMap((segment) => {
+      if (segment.value <= 0) {
+        return [];
+      }
+      const end = start + segment.percentage;
+      const stop = `${segment.color} ${start}% ${end}%`;
+      start = end;
+      return [stop];
+    });
+
+    return stops.length > 0
+      ? `conic-gradient(${stops.join(", ")})`
+      : "conic-gradient(#2d3b32 0% 100%)";
+  }, [portfolio.segments]);
+  const visibleCollection = useMemo(
+    () => filterCollectionByBinder(collection, selectedBinderView),
+    [collection, selectedBinderView]
+  );
+  const visibleBinders = useMemo(() => {
+    const query = binderDashboardQuery.trim().toLocaleLowerCase();
+    return query
+      ? binders.filter((binder) =>
+          binder.name.toLocaleLowerCase().includes(query)
+        )
+      : binders;
+  }, [binders, binderDashboardQuery]);
+  const activeBinderDraftValue = selectedBinderView.startsWith("binder:")
+    ? selectedBinderView.slice("binder:".length)
+    : "";
+  const activeBinder =
+    binders.find(
+      (binder) => selectedBinderView === `binder:${binder.id}`
+    ) ?? null;
+  const editingBinder =
+    binders.find((binder) => binder.id === editingBinderId) ?? null;
+  const activeBinderName =
+    selectedBinderView === "unassigned"
+      ? "Unassigned copies"
+      : activeBinder?.name ?? "Cards on the shelf";
+  const isDashboard = selectedBinderView === "dashboard";
   const visiblePrintings = useMemo(() => {
     const terms = printingQuery
       .trim()
@@ -497,17 +1020,17 @@ export default function CollectionManager({
     () =>
       Array.from(
         new Set(
-          collection.flatMap((card) =>
+          visibleCollection.flatMap((card) =>
             card.printings.map((printing) => printing.set_code.toUpperCase())
           )
         )
       ).sort(),
-    [collection]
+    [visibleCollection]
   );
   const entries = useMemo(() => {
     const normalizedFilter = searchFilter.trim().toLowerCase();
 
-    return collection
+    return visibleCollection
       .flatMap((card) =>
         card.printings.map((printing) => ({ card, printing }))
       )
@@ -530,23 +1053,86 @@ export default function CollectionManager({
         return matchesText && matchesSet;
       })
       .sort((left, right) => {
+        const direction = sortDirection === "asc" ? 1 : -1;
+        const compareNames = () => left.card.name.localeCompare(right.card.name);
+
         if (sortBy === "quantity") {
-          return right.printing.copies.length - left.printing.copies.length;
+          return (
+            (left.printing.copies.length - right.printing.copies.length) *
+              direction ||
+            compareNames() * direction
+          );
         }
         if (sortBy === "set") {
-          return left.printing.set_code.localeCompare(right.printing.set_code);
+          return (
+            left.printing.set_code.localeCompare(right.printing.set_code) *
+              direction ||
+            compareNames() * direction
+          );
         }
-        return left.card.name.localeCompare(right.card.name);
+        if (sortBy === "purchase-date") {
+          const leftDate = getLatestPurchaseDate(left.printing.copies);
+          const rightDate = getLatestPurchaseDate(right.printing.copies);
+          if (leftDate === null || rightDate === null) {
+            if (leftDate === rightDate) {
+              return compareNames() * direction;
+            }
+            return leftDate === null ? 1 : -1;
+          }
+          return (
+            leftDate.localeCompare(rightDate) * direction ||
+            compareNames() * direction
+          );
+        }
+        if (sortBy === "purchase-value") {
+          const leftPrice = getAveragePurchasePrice(left.printing.copies);
+          const rightPrice = getAveragePurchasePrice(right.printing.copies);
+          if (leftPrice === null || rightPrice === null) {
+            if (leftPrice === rightPrice) {
+              return compareNames() * direction;
+            }
+            return leftPrice === null ? 1 : -1;
+          }
+          return (
+            (leftPrice - rightPrice) * direction ||
+            compareNames() * direction
+          );
+        }
+        if (
+          sortBy === "current-value" ||
+          sortBy === "absolute-change" ||
+          sortBy === "relative-change"
+        ) {
+          const metric =
+            sortBy === "current-value"
+              ? "currentValue"
+              : sortBy === "absolute-change"
+                ? "absoluteChange"
+                : "relativeChange";
+          const leftValue = getPrintingValuation(left.printing)[metric];
+          const rightValue = getPrintingValuation(right.printing)[metric];
+          if (leftValue === null || rightValue === null) {
+            if (leftValue === rightValue) {
+              return compareNames() * direction;
+            }
+            return leftValue === null ? 1 : -1;
+          }
+          return (
+            (leftValue - rightValue) * direction ||
+            compareNames() * direction
+          );
+        }
+        return compareNames() * direction;
       });
-  }, [collection, searchFilter, selectedSet, sortBy]);
+  }, [visibleCollection, searchFilter, selectedSet, sortBy, sortDirection]);
   const selectedEntries = useMemo(
     () =>
-      collection
+      visibleCollection
         .flatMap((card) =>
           card.printings.map((printing) => ({ card, printing }))
         )
         .filter(({ printing }) => selectedPrintingIds.includes(printing.id)),
-    [collection, selectedPrintingIds]
+    [visibleCollection, selectedPrintingIds]
   );
   const selectedCopyIds = selectedEntries.flatMap(({ printing }) =>
     printing.copies.map((copy) => copy.id)
@@ -570,7 +1156,13 @@ export default function CollectionManager({
   }
 
   function syncActiveEntry(updatedCollection: Card[], entry: CollectionEntry) {
-    const updatedCard = updatedCollection.find((card) => card.id === entry.card.id);
+    const activeCollection = filterCollectionByBinder(
+      updatedCollection,
+      selectedBinderView
+    );
+    const updatedCard = activeCollection.find(
+      (card) => card.id === entry.card.id
+    );
     const updatedPrinting = updatedCard?.printings.find(
       (printing) => printing.id === entry.printing.id
     );
@@ -655,12 +1247,34 @@ export default function CollectionManager({
 
   function selectPrinting(printing: ScryfallCard) {
     setSelectedCard(printing);
+    const finish = getDefaultFinish(printing, copyDefaults.finish);
+    const purchasePrice = getScryfallCurrentEuroPrice(printing, finish);
+    setAutoPurchasePrice(true);
     setAddDraft({
-      ...createCopyDraft(
-        copyDefaults,
-        getDefaultFinish(printing, copyDefaults.finish)
-      ),
+      ...createCopyDraft(copyDefaults, finish, activeBinderDraftValue),
+      purchase_price: purchasePrice === null ? "" : String(purchasePrice),
     });
+  }
+
+  function handleAddDraftChange(draft: CopyDraft) {
+    const finishChanged = draft.finish !== addDraft.finish;
+    const purchasePriceChanged =
+      draft.purchase_price !== addDraft.purchase_price;
+
+    if (purchasePriceChanged) {
+      setAutoPurchasePrice(false);
+    } else if (finishChanged && autoPurchasePrice && selectedCard) {
+      const purchasePrice = getScryfallCurrentEuroPrice(
+        selectedCard,
+        draft.finish
+      );
+      draft = {
+        ...draft,
+        purchase_price: purchasePrice === null ? "" : String(purchasePrice),
+      };
+    }
+
+    setAddDraft(draft);
   }
 
   async function handleAddCard(event: React.FormEvent<HTMLFormElement>) {
@@ -683,7 +1297,10 @@ export default function CollectionManager({
       setSelectedSearchCard(null);
       setCardPrintings([]);
       setSelectedCard(null);
-      setAddDraft(createCopyDraft(copyDefaults));
+      setAddDraft(
+        createCopyDraft(copyDefaults, copyDefaults.finish, activeBinderDraftValue)
+      );
+      setAutoPurchasePrice(false);
       setNotice(`${selectedCard.name} was added to your collection.`);
     } catch (error) {
       setDialogError(getErrorMessage(error));
@@ -704,7 +1321,13 @@ export default function CollectionManager({
     try {
       await createOwnedCopy(
         entry.printing.id,
-        toCopyInput(createCopyDraft(copyDefaults))
+        toCopyInput(
+          createCopyDraft(
+            copyDefaults,
+            copyDefaults.finish,
+            activeBinderDraftValue
+          )
+        )
       );
       const updatedCollection = await refreshCollection();
       if (activeEntry) {
@@ -780,8 +1403,289 @@ export default function CollectionManager({
     setSelectedCard(null);
     setSearchError("");
     setSearching(false);
-    setAddDraft(createCopyDraft(copyDefaults));
+    setAddDraft(
+      createCopyDraft(copyDefaults, copyDefaults.finish, activeBinderDraftValue)
+    );
+    setAutoPurchasePrice(false);
     setIsAddOpen(true);
+  }
+
+  function handleSortKeyChange(sortKey: string) {
+    setSortBy(sortKey);
+    setSortDirection(
+      sortKey === "name" || sortKey === "set" ? "asc" : "desc"
+    );
+  }
+
+  function handleSortDirectionChange(direction: string) {
+    if (direction === "asc" || direction === "desc") {
+      setSortDirection(direction);
+    }
+  }
+
+  function handleBinderViewChange(binderView: string) {
+    if (binderView === "all") {
+      router.push("/collection");
+    } else if (binderView === "unassigned") {
+      router.push("/unassigned");
+    } else if (binderView.startsWith("binder:")) {
+      router.push(`/binders/${binderView.slice("binder:".length)}`);
+    }
+  }
+
+  function openBinderCoverPicker(target: "new" | number) {
+    binderImageRequestRef.current += 1;
+    setBinderCoverTarget(target);
+    setBinderImageQuery("");
+    setBinderImageResults([]);
+    setBinderImageCard(null);
+    setBinderImagePrintings([]);
+    setBinderImageError("");
+    setBinderCoverPickerOpen(true);
+  }
+
+  function closeBinderCoverPicker() {
+    binderImageRequestRef.current += 1;
+    setBinderCoverPickerOpen(false);
+    setBinderCoverTarget(null);
+    setBinderImageLoading(false);
+  }
+
+  async function handleSearchBinderImage(
+    event: React.FormEvent<HTMLFormElement>
+  ) {
+    event.preventDefault();
+    const query = binderImageQuery.trim();
+    if (query.length < 2) {
+      setBinderImageError("Enter at least two characters to search.");
+      return;
+    }
+
+    const requestId = ++binderImageRequestRef.current;
+    setBinderImageLoading(true);
+    setBinderImageError("");
+    setBinderImageCard(null);
+    setBinderImagePrintings([]);
+    try {
+      const results = await searchCardCatalog(query);
+      if (requestId === binderImageRequestRef.current) {
+        setBinderImageResults(results.slice(0, 24));
+      }
+    } catch (error) {
+      if (requestId === binderImageRequestRef.current) {
+        setBinderImageError(getErrorMessage(error));
+      }
+    } finally {
+      if (requestId === binderImageRequestRef.current) {
+        setBinderImageLoading(false);
+      }
+    }
+  }
+
+  async function handleSelectBinderImageCard(card: ScryfallCard) {
+    if (!card.oracle_id) {
+      setBinderImageError("This card does not have a printable card identity.");
+      return;
+    }
+
+    const requestId = ++binderImageRequestRef.current;
+    setBinderImageCard(card);
+    setBinderImagePrintings([]);
+    setBinderImageLoading(true);
+    setBinderImageError("");
+    try {
+      const printings = await getCardPrintings(card.oracle_id);
+      if (requestId === binderImageRequestRef.current) {
+        setBinderImagePrintings(
+          [...printings].sort((left, right) =>
+            (right.released_at ?? "").localeCompare(left.released_at ?? "")
+          )
+        );
+      }
+    } catch (error) {
+      if (requestId === binderImageRequestRef.current) {
+        setBinderImageError(getErrorMessage(error));
+      }
+    } finally {
+      if (requestId === binderImageRequestRef.current) {
+        setBinderImageLoading(false);
+      }
+    }
+  }
+
+  function returnToBinderImageResults() {
+    binderImageRequestRef.current += 1;
+    setBinderImageCard(null);
+    setBinderImagePrintings([]);
+    setBinderImageError("");
+    setBinderImageLoading(false);
+  }
+
+  function handleChooseBinderCover(printing: ScryfallCard) {
+    if (binderCoverTarget === null) {
+      return;
+    }
+    if (printing.printing_id === undefined) {
+      setBinderImageError("This printing is not available in the local catalog.");
+      return;
+    }
+    if (!printing.image_uris?.art_crop) {
+      setBinderImageError("This printing does not have a cropped artwork image.");
+      return;
+    }
+
+    const cover: Partial<BinderDraft> = {
+      cover_printing_id: printing.printing_id,
+      cover_image_uri: printing.image_uris.art_crop,
+      cover_card_name: printing.name,
+      cover_set_code: printing.set,
+      cover_collector_number: printing.collector_number,
+    };
+    if (binderCoverTarget === "new") {
+      setNewBinderDraft((current) => ({ ...current, ...cover }));
+    } else {
+      setEditingBinderDraft((current) => ({ ...current, ...cover }));
+    }
+    setBinderCoverPickerOpen(false);
+    setBinderCoverTarget(null);
+  }
+
+  function handleClearBinderCover(target: "new" | number) {
+    const cover: Partial<BinderDraft> = {
+      cover_printing_id: null,
+      cover_image_uri: null,
+      cover_card_name: null,
+      cover_set_code: null,
+      cover_collector_number: null,
+    };
+    if (target === "new") {
+      setNewBinderDraft((current) => ({ ...current, ...cover }));
+    } else {
+      setEditingBinderDraft((current) => ({ ...current, ...cover }));
+    }
+  }
+
+  async function handleCreateBinder(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const name = newBinderDraft.name.trim();
+    if (!name) {
+      setBinderError("Enter a binder name.");
+      return;
+    }
+
+    setBinderBusy(true);
+    setBinderError("");
+    try {
+      const binder = await createBinder({
+        name,
+        color: newBinderDraft.color,
+        cover_printing_id: newBinderDraft.cover_printing_id,
+      });
+      setBinders((current) =>
+        [...current, binder].sort((left, right) =>
+          left.name.localeCompare(right.name)
+        )
+      );
+      setNewBinderDraft(emptyBinderDraft);
+      handleBinderViewChange(`binder:${binder.id}`);
+      setNotice(`Created ${binder.name}.`);
+    } catch (error) {
+      setBinderError(getErrorMessage(error));
+    } finally {
+      setBinderBusy(false);
+    }
+  }
+
+  async function handleSaveBinder(
+    event: React.FormEvent<HTMLFormElement>,
+    binderId: number
+  ) {
+    event.preventDefault();
+    const name = editingBinderDraft.name.trim();
+    if (!name) {
+      setBinderError("Enter a binder name.");
+      return;
+    }
+
+    setBinderBusy(true);
+    setBinderError("");
+    try {
+      const binder = await updateBinder(binderId, {
+        name,
+        color: editingBinderDraft.color,
+        cover_printing_id: editingBinderDraft.cover_printing_id,
+      });
+      setBinders((current) =>
+        current
+          .map((item) => (item.id === binder.id ? binder : item))
+          .sort((left, right) => left.name.localeCompare(right.name))
+      );
+      setEditingBinderId(null);
+      setEditingBinderDraft(emptyBinderDraft);
+      setNotice(`Updated ${binder.name}.`);
+    } catch (error) {
+      setBinderError(getErrorMessage(error));
+    } finally {
+      setBinderBusy(false);
+    }
+  }
+
+  async function handleDeleteBinder(binder: Binder) {
+    const copyCount = collection.reduce(
+      (total, card) =>
+        total +
+        card.printings.reduce(
+          (printingTotal, printing) =>
+            printingTotal +
+            printing.copies.filter((copy) => copy.binder_id === binder.id)
+              .length,
+          0
+        ),
+      0
+    );
+    if (
+      !window.confirm(
+        `Delete "${binder.name}"? ${copyCount} ${copyCount === 1 ? "copy will" : "copies will"} become unassigned.`
+      )
+    ) {
+      return;
+    }
+
+    setBinderBusy(true);
+    setBinderError("");
+    try {
+      await deleteBinder(binder.id);
+      setBinders((current) =>
+        current.filter((item) => item.id !== binder.id)
+      );
+      if (selectedBinderView === `binder:${binder.id}`) {
+        handleBinderViewChange("all");
+      }
+      setEditingBinderId(null);
+      setEditingBinderDraft(emptyBinderDraft);
+      try {
+        await refreshCollection();
+      } catch (error) {
+        setPageError(
+          `Binder deleted, but the collection could not be refreshed: ${getErrorMessage(error)}`
+        );
+      }
+      setNotice(`Deleted ${binder.name}; its copies are now unassigned.`);
+    } catch (error) {
+      setBinderError(getErrorMessage(error));
+    } finally {
+      setBinderBusy(false);
+    }
+  }
+
+  function closeBinderManager() {
+    if (binderBusy) {
+      return;
+    }
+    setBinderManagerOpen(false);
+    setEditingBinderId(null);
+    setEditingBinderDraft(emptyBinderDraft);
+    setBinderError("");
   }
 
   function openSettingsDialog() {
@@ -914,6 +1818,12 @@ export default function CollectionManager({
     if (bulkLanguage.trim()) {
       updates.language = bulkLanguage.trim();
     }
+    if (bulkBinder !== "unchanged") {
+      updates.binder_id =
+        bulkBinder === "unassigned"
+          ? null
+          : Number(bulkBinder.slice("binder:".length));
+    }
 
     if (Object.keys(updates).length === 0) {
       setBulkError("Choose at least one field to update.");
@@ -935,6 +1845,7 @@ export default function CollectionManager({
       setBulkCondition("");
       setBulkFinish("");
       setBulkLanguage("");
+      setBulkBinder("unchanged");
     } catch (error) {
       setBulkError(getErrorMessage(error));
     } finally {
@@ -969,7 +1880,7 @@ export default function CollectionManager({
   }
 
   return (
-    <main className="app-shell">
+    <main className="app-shell workspace-shell">
       <header className="topbar">
         <Link className="brand" href="/" aria-label="Vexing Bauble home">
           <span className="brand-mark" aria-hidden="true">
@@ -983,15 +1894,89 @@ export default function CollectionManager({
         </div>
       </header>
 
+      <div className="workspace-layout">
+        <aside className="side-menu">
+          <nav className="side-navigation" aria-label="Collection">
+            <p className="side-navigation-label">COLLECTION</p>
+            <Link
+              className={`side-navigation-link${isDashboard ? " selected" : ""}`}
+              href="/"
+              aria-current={isDashboard ? "page" : undefined}
+            >
+              <span aria-hidden="true">◉</span>
+              Overview
+            </Link>
+            <Link
+              className={`side-navigation-link${selectedBinderView === "all" ? " selected" : ""}`}
+              href="/collection"
+              aria-current={selectedBinderView === "all" ? "page" : undefined}
+            >
+              <span aria-hidden="true">▤</span>
+              All collection
+            </Link>
+            <Link
+              className={`side-navigation-link${selectedBinderView === "unassigned" ? " selected" : ""}`}
+              href="/unassigned"
+              aria-current={
+                selectedBinderView === "unassigned" ? "page" : undefined
+              }
+            >
+              <span aria-hidden="true">▤</span>
+              Unassigned
+            </Link>
+            <p className="side-navigation-label side-navigation-binders">
+              BINDERS
+            </p>
+            {binders.map((binder) => {
+              const isSelected =
+                selectedBinderView === `binder:${binder.id}`;
+              return (
+                <Link
+                  className={`side-navigation-link binder-navigation-link${isSelected ? " selected" : ""}`}
+                  href={`/binders/${binder.id}`}
+                  key={binder.id}
+                  aria-current={isSelected ? "page" : undefined}
+                >
+                  <span
+                    className="side-navigation-color"
+                    style={{ backgroundColor: binder.color }}
+                    aria-hidden="true"
+                  />
+                  <span className="side-navigation-name">{binder.name}</span>
+                </Link>
+              );
+            })}
+            <button
+              type="button"
+              className="side-navigation-manage"
+              onClick={() => {
+                setBinderError("");
+                setBinderManagerOpen(true);
+              }}
+              disabled={binderBusy}
+            >
+              <span aria-hidden="true">＋</span>
+              Manage binders
+            </button>
+          </nav>
+        </aside>
+
+        <div className="workspace-content">
       <section className="hero">
         <div className="hero-copy">
           <p className="eyebrow">THE BINDER</p>
-          <h1>Your collection,<br />beautifully gathered.</h1>
+          <h1>
+            {isDashboard
+              ? "Collection overview"
+              : activeBinder?.name ?? activeBinderName}
+          </h1>
           <p className="hero-description">
-            Every printing, every copy, all in one place.
+            {isDashboard
+              ? "Your collection at a glance."
+              : "Every printing, every copy, all in one place."}
           </p>
         </div>
-        <div className="hero-actions">
+        {!isDashboard && <div className="hero-actions">
           <button
             className="secondary-button settings-button"
             onClick={openSettingsDialog}
@@ -1014,10 +1999,10 @@ export default function CollectionManager({
             <span aria-hidden="true">+</span>
             Add a card
           </button>
-        </div>
+        </div>}
       </section>
 
-      {catalogStatus &&
+      {!isDashboard && catalogStatus &&
         (catalogStatus.status !== "ready" ||
           catalogStatus.refreshing ||
           catalogStatus.error) && (
@@ -1059,31 +2044,187 @@ export default function CollectionManager({
           </section>
         )}
 
-      <section className="collection-overview" aria-label="Collection overview">
-        <div className="overview-copy">
-          <span className="overview-label">IN YOUR COLLECTION</span>
-          <span className="overview-total">
-            {totalCopies.toLocaleString()}{" "}
-            <span>{totalCopies === 1 ? "card" : "cards"}</span>
-          </span>
-        </div>
-        <div className="overview-divider" />
-        <div className="overview-stat">
-          <strong>{collection.length.toLocaleString()}</strong>
-          <span>unique cards</span>
-        </div>
-        <div className="overview-stat">
-          <strong>{totalPrintings.toLocaleString()}</strong>
-          <span>printings</span>
-        </div>
-        <span className="overview-decoration" aria-hidden="true">✳</span>
-      </section>
-
-      <section className="collection-section">
-        <div className="section-heading">
+      {isDashboard && <section className="portfolio-dashboard" aria-labelledby="portfolio-title">
+        <div className="portfolio-dashboard-heading">
           <div>
-            <p className="eyebrow">YOUR INVENTORY</p>
-            <h2>Cards on the shelf</h2>
+            <p className="eyebrow">YOUR COLLECTION</p>
+            <h2 id="portfolio-title">Collection</h2>
+          </div>
+          <button
+            type="button"
+            className="secondary-button"
+            onClick={() => {
+              setBinderError("");
+              setBinderManagerOpen(true);
+            }}
+            disabled={binderBusy}
+          >
+            Manage binders
+          </button>
+        </div>
+        <div className="portfolio-chart" aria-label="Value share by binder">
+          <div
+            className="portfolio-donut"
+            role="img"
+            aria-label={`Collection value ${formatEuroAmount(portfolio.total) ?? "0 euros"} across ${portfolio.totalCopies.toLocaleString()} cards`}
+            style={{ background: portfolioGradient }}
+          >
+            <div className="portfolio-donut-center">
+              <span
+                className={`portfolio-change ${getPortfolioChangeClass(portfolio.absoluteChange)}`}
+              >
+                {formatPortfolioChange(
+                  portfolio.absoluteChange,
+                  portfolio.relativeChange
+                )}
+              </span>
+              <strong>{formatEuroAmount(portfolio.total) ?? "€0.00"}</strong>
+              <span className="portfolio-donut-count">
+                {portfolio.totalCopies.toLocaleString()}{" "}
+                {portfolio.totalCopies === 1 ? "card" : "cards"}
+              </span>
+            </div>
+          </div>
+        </div>
+        {portfolio.unpricedCopies > 0 && (
+          <p className="portfolio-note">
+            {portfolio.unpricedCopies.toLocaleString()}{" "}
+            {portfolio.unpricedCopies === 1 ? "copy has" : "copies have"} no
+            current market price and are excluded from the total.
+          </p>
+        )}
+        <div className="binder-dashboard-heading">
+          <div>
+            <p className="eyebrow">YOUR BINDERS</p>
+            <h3>Binders</h3>
+          </div>
+          {binders.length > 0 && (
+            <label className="binder-dashboard-search">
+              <span className="search-icon" aria-hidden="true">
+                ⌕
+              </span>
+              <input
+                type="search"
+                aria-label="Search binders"
+                placeholder="Search binders"
+                value={binderDashboardQuery}
+                onChange={(event) =>
+                  setBinderDashboardQuery(event.target.value)
+                }
+              />
+            </label>
+          )}
+        </div>
+        {binders.length === 0 ? (
+          <div className="binder-dashboard-empty">
+            <p>Create a binder to group your cards and track its value.</p>
+            <button
+              type="button"
+              className="secondary-button"
+              onClick={() => {
+                setBinderError("");
+                setBinderManagerOpen(true);
+              }}
+            >
+              Create a binder
+            </button>
+          </div>
+        ) : visibleBinders.length === 0 ? (
+          <p className="binder-dashboard-empty">
+            No binders match &quot;{binderDashboardQuery.trim()}&quot;.
+          </p>
+        ) : (
+          <div className="binder-dashboard-list">
+            {visibleBinders.map((binder) => {
+              const segment = portfolioSegmentsByKey.get(
+                `binder:${binder.id}`
+              );
+              if (!segment) {
+                return null;
+              }
+
+              return (
+                <Link
+                  className={`binder-dashboard-card${selectedBinderView === segment.key ? " selected" : ""}`}
+                  key={binder.id}
+                  href={`/binders/${binder.id}`}
+                  aria-current={selectedBinderView === segment.key ? "page" : undefined}
+                >
+                  <span className="binder-dashboard-art" aria-hidden="true">
+                    {binder.cover_image_uri && (
+                      <Image
+                        src={binder.cover_image_uri}
+                        alt=""
+                        width={880}
+                        height={180}
+                        unoptimized
+                      />
+                    )}
+                  </span>
+                  <span
+                    className="binder-dashboard-accent"
+                    style={{ backgroundColor: binder.color }}
+                    aria-hidden="true"
+                  />
+                  <span className="binder-dashboard-copy">
+                    <strong>{binder.name}</strong>
+                    <small>
+                      {segment.copies.toLocaleString()}{" "}
+                      {segment.copies === 1 ? "card" : "cards"}
+                    </small>
+                  </span>
+                  <span className="binder-dashboard-value">
+                    <strong>
+                      {formatEuroAmount(segment.value) ?? "€0.00"}
+                    </strong>
+                    <small
+                      className={`portfolio-change ${getPortfolioChangeClass(segment.absoluteChange)}`}
+                    >
+                      {formatPortfolioChange(
+                        segment.absoluteChange,
+                        segment.relativeChange
+                      )}
+                    </small>
+                  </span>
+                </Link>
+              );
+            })}
+          </div>
+        )}
+      </section>}
+
+      {!isDashboard && <section className="collection-section">
+        <div className="section-heading">
+          <div className="inventory-heading">
+            {activeBinder && (
+              <div
+                className="selected-binder-cover"
+                style={{
+                  backgroundColor: activeBinder.color,
+                  borderColor: activeBinder.color,
+                }}
+              >
+                {activeBinder.cover_image_uri && (
+                  <Image
+                    src={activeBinder.cover_image_uri}
+                    alt={`${activeBinder.name} cover artwork`}
+                    width={420}
+                    height={170}
+                    unoptimized
+                  />
+                )}
+              </div>
+            )}
+            <div>
+              <p className="eyebrow">YOUR INVENTORY</p>
+              <h2>
+                {selectedBinderView === "all"
+                  ? "Cards on the shelf"
+                  : selectedBinderView === "unassigned"
+                    ? "Unassigned copies"
+                    : `Cards in ${activeBinderName}`}
+              </h2>
+            </div>
           </div>
           <span className="result-count">
             {entries.length} {entries.length === 1 ? "printing" : "printings"}
@@ -1123,15 +2264,33 @@ export default function CollectionManager({
             </select>
           </label>
           <label className="toolbar-select">
-            <span>SORT</span>
+            <span>SORT BY</span>
             <select
-              aria-label="Sort collection"
+              aria-label="Sort collection by"
               value={sortBy}
-              onChange={(event) => setSortBy(event.target.value)}
+              onChange={(event) => handleSortKeyChange(event.target.value)}
             >
               <option value="name">Name</option>
               <option value="set">Set</option>
               <option value="quantity">Quantity</option>
+              <option value="purchase-date">Purchase date</option>
+              <option value="purchase-value">Purchase value</option>
+              <option value="current-value">Current value (€ / copy)</option>
+              <option value="absolute-change">Value change (€ / copy)</option>
+              <option value="relative-change">Value change (%)</option>
+            </select>
+          </label>
+          <label className="toolbar-select">
+            <span>DIRECTION</span>
+            <select
+              aria-label="Sort direction"
+              value={sortDirection}
+              onChange={(event) =>
+                handleSortDirectionChange(event.target.value)
+              }
+            >
+              <option value="asc">Ascending</option>
+              <option value="desc">Descending</option>
             </select>
           </label>
         </div>
@@ -1167,6 +2326,10 @@ export default function CollectionManager({
                 className="secondary-button bulk-edit-button"
                 onClick={() => {
                   setBulkError("");
+                  setBulkCondition("");
+                  setBulkFinish("");
+                  setBulkLanguage("");
+                  setBulkBinder("unchanged");
                   setBulkEditOpen(true);
                 }}
                 disabled={busy || selectedCopyIds.length === 0}
@@ -1218,6 +2381,14 @@ export default function CollectionManager({
               const imageUrl = printing.image_uri;
               const quantity = printing.copies.length;
               const foreignLanguages = getForeignLanguages(printing.copies);
+              const valuation = getPrintingValuation(printing);
+              const absoluteChange = formatPriceChange(
+                valuation.absoluteChange
+              );
+              const relativeChange = formatPercentChange(
+                valuation.relativeChange
+              );
+              const rarityClass = `rarity-${printing.rarity?.toLowerCase() ?? "common"}`;
               const foil = printing.copies.some((copy) =>
                 ["foil", "etched"].includes(copy.finish.toLowerCase())
               );
@@ -1271,6 +2442,12 @@ export default function CollectionManager({
                           : `${getLanguageLabel(foreignLanguages[0])}+${foreignLanguages.length - 1}`}
                       </span>
                     )}
+                    <span
+                      className="market-price-badge"
+                      title="Current market price per copy"
+                    >
+                      {formatEuroAmount(valuation.currentValue) ?? "— €"}
+                    </span>
                   </button>
                   {selectionMode && (
                     <span
@@ -1280,6 +2457,42 @@ export default function CollectionManager({
                       {isSelected ? "✓" : ""}
                     </span>
                   )}
+                  <div
+                    className="card-valuation"
+                    title="Average market value and price change per owned copy, using Scryfall EUR prices and recorded purchase prices."
+                  >
+                    <div className="card-printing-meta">
+                      <Image
+                        className={`set-symbol ${rarityClass}`}
+                        src={`https://svgs.scryfall.io/sets/${printing.set_code.toLowerCase()}.svg`}
+                        alt=""
+                        aria-hidden="true"
+                        width={16}
+                        height={16}
+                        loading="lazy"
+                        unoptimized
+                        style={{ width: 16, height: 16 }}
+                        onError={(event) => {
+                          event.currentTarget.style.visibility = "hidden";
+                        }}
+                      />
+                      <strong>{printing.set_code.toUpperCase()}</strong>
+                      <span>#{printing.collector_number}</span>
+                    </div>
+                    <span
+                      className={
+                        valuation.absoluteChange === null ||
+                        valuation.absoluteChange === 0
+                          ? "neutral"
+                          : valuation.absoluteChange > 0
+                            ? "positive"
+                            : "negative"
+                      }
+                    >
+                      {absoluteChange ?? "unavailable"} (
+                      {relativeChange ?? "—"})
+                    </span>
+                  </div>
                 </article>
               );
             })}
@@ -1287,10 +2500,26 @@ export default function CollectionManager({
         ) : (
           <div className="empty-state">
             <span className="empty-mark" aria-hidden="true">✳</span>
-            <h3>{collection.length ? "No cards match that search" : "A binder full of possibility"}</h3>
+            <h3>
+              {collection.length === 0
+                ? "A binder full of possibility"
+                : searchFilter || selectedSet !== "all"
+                  ? "No cards match that search"
+                  : selectedBinderView === "unassigned"
+                    ? "No unassigned copies"
+                    : selectedBinderView === "all"
+                      ? "No cards match that search"
+                      : `No cards in ${activeBinderName}`}
+            </h3>
             <p>
               {collection.length
-                ? "Try a different name, set, or collector number."
+                ? searchFilter || selectedSet !== "all"
+                  ? "Try a different name, set, or collector number."
+                  : selectedBinderView === "unassigned"
+                    ? "All of your copies are already assigned to a binder."
+                    : selectedBinderView === "all"
+                      ? "Try a different name, set, or collector number."
+                      : "Assign copies to this binder from the collection or bulk-edit tools."
                 : "Start your collection by adding your first card."}
             </p>
             {collection.length === 0 && (
@@ -1301,12 +2530,505 @@ export default function CollectionManager({
             )}
           </div>
         )}
-      </section>
+      </section>}
 
       <footer className="page-footer">
         <span>VEXING BAUBLE</span>
         <span>A LITTLE ORDER FOR YOUR MAGIC</span>
       </footer>
+
+      {binderManagerOpen && (
+        <div
+          className="modal-backdrop"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) {
+              closeBinderManager();
+            }
+          }}
+        >
+          <section
+            className="modal binder-manager-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="binder-manager-title"
+          >
+            <div className="modal-header">
+              <div>
+                <p className="eyebrow">ORGANIZE YOUR COPIES</p>
+                <h2 id="binder-manager-title">
+                  {editingBinderId === null ? "Manage binders" : "Edit binder"}
+                </h2>
+              </div>
+              <button
+                className="modal-close"
+                aria-label="Close"
+                onClick={closeBinderManager}
+                disabled={binderBusy}
+              >
+                ×
+              </button>
+            </div>
+            {editingBinderId === null ? (
+              <>
+                <p className="import-description">
+                  Each copy can belong to one binder. Deleting a binder keeps
+                  its cards and moves those copies to Unassigned.
+                </p>
+                <form
+                  className="binder-create-form"
+                  onSubmit={handleCreateBinder}
+                >
+                  <div className="binder-draft-controls">
+                    <label className="field">
+                      <span>New binder name</span>
+                      <input
+                        type="text"
+                        maxLength={80}
+                        autoComplete="off"
+                        placeholder="e.g. Modern deck"
+                        value={newBinderDraft.name}
+                        onChange={(event) =>
+                          setNewBinderDraft((current) => ({
+                            ...current,
+                            name: event.target.value,
+                          }))
+                        }
+                      />
+                    </label>
+                    <label className="field binder-color-field">
+                      <span>Color</span>
+                      <input
+                        type="color"
+                        aria-label="New binder color"
+                        value={newBinderDraft.color}
+                        onChange={(event) =>
+                          setNewBinderDraft((current) => ({
+                            ...current,
+                            color: event.target.value,
+                          }))
+                        }
+                      />
+                    </label>
+                  </div>
+                  <div className="binder-cover-controls">
+                    <BinderCoverPreview binder={newBinderDraft} />
+                    <div>
+                      <button
+                        type="button"
+                        className="secondary-button"
+                        onClick={() => openBinderCoverPicker("new")}
+                        disabled={binderBusy}
+                      >
+                        Choose cover art
+                      </button>
+                      {newBinderDraft.cover_printing_id !== null && (
+                        <button
+                          type="button"
+                          className="text-button"
+                          onClick={() => handleClearBinderCover("new")}
+                          disabled={binderBusy}
+                        >
+                          Clear
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                  <button
+                    className="primary-button"
+                    disabled={binderBusy || !newBinderDraft.name.trim()}
+                  >
+                    {binderBusy ? "Saving..." : "Create binder"}
+                  </button>
+                </form>
+                <div className="binder-manager-list">
+                  {binders.length === 0 ? (
+                    <p className="binder-manager-empty">
+                      No binders yet. Create one to start organizing copies.
+                    </p>
+                  ) : (
+                    binders.map((binder) => (
+                      <div className="binder-manager-row" key={binder.id}>
+                        <div className="binder-row-summary">
+                          <span
+                            className="binder-row-color"
+                            style={{ backgroundColor: binder.color }}
+                          />
+                          <span
+                            className="binder-row-cover"
+                            style={{ backgroundColor: `${binder.color}30` }}
+                          >
+                            {binder.cover_image_uri && (
+                              <Image
+                                src={binder.cover_image_uri}
+                                alt=""
+                                width={160}
+                                height={72}
+                                unoptimized
+                              />
+                            )}
+                          </span>
+                          <span className="binder-row-copy">
+                            <strong>{binder.name}</strong>
+                            <small>
+                              {binder.cover_card_name
+                                ? `${binder.cover_card_name}${binder.cover_set_code ? ` · ${binder.cover_set_code.toUpperCase()}` : ""}`
+                                : "No cover art selected"}
+                            </small>
+                          </span>
+                        </div>
+                        <div className="binder-row-actions">
+                          <button
+                            type="button"
+                            className="text-button"
+                            onClick={() => {
+                              setEditingBinderId(binder.id);
+                              setEditingBinderDraft({
+                                name: binder.name,
+                                color: binder.color,
+                                cover_printing_id: binder.cover_printing_id,
+                                cover_image_uri: binder.cover_image_uri,
+                                cover_card_name: binder.cover_card_name,
+                                cover_set_code: binder.cover_set_code,
+                                cover_collector_number:
+                                  binder.cover_collector_number,
+                              });
+                              setBinderError("");
+                            }}
+                            disabled={binderBusy}
+                          >
+                            Edit binder
+                          </button>
+                          <button
+                            type="button"
+                            className="text-button danger-text-button"
+                            onClick={() => void handleDeleteBinder(binder)}
+                            disabled={binderBusy}
+                          >
+                            Delete
+                          </button>
+                        </div>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </>
+            ) : editingBinder ? (
+              <>
+                <button
+                  type="button"
+                  className="secondary-button binder-editor-back"
+                  onClick={() => {
+                    setEditingBinderId(null);
+                    setEditingBinderDraft(emptyBinderDraft);
+                    setBinderError("");
+                  }}
+                  disabled={binderBusy}
+                >
+                  Back to binders
+                </button>
+                <form
+                  className="binder-edit-form"
+                  onSubmit={(event) =>
+                    handleSaveBinder(event, editingBinder.id)
+                  }
+                >
+                  <div className="binder-editor-heading">
+                    <div>
+                      <span className="eyebrow">EDITING BINDER</span>
+                      <strong>{editingBinder.name}</strong>
+                    </div>
+                    <span
+                      className="binder-editor-color-chip"
+                      style={{
+                        backgroundColor: editingBinderDraft.color,
+                      }}
+                      aria-hidden="true"
+                    />
+                  </div>
+                  <div className="binder-editor-fields">
+                    <label className="field">
+                      <span>Binder name</span>
+                      <input
+                        type="text"
+                        aria-label={`Rename ${editingBinder.name}`}
+                        maxLength={80}
+                        value={editingBinderDraft.name}
+                        onChange={(event) =>
+                          setEditingBinderDraft((current) => ({
+                            ...current,
+                            name: event.target.value,
+                          }))
+                        }
+                      />
+                    </label>
+                    <label className="field binder-color-field">
+                      <span>Binder color</span>
+                      <input
+                        type="color"
+                        aria-label={`${editingBinder.name} color`}
+                        value={editingBinderDraft.color}
+                        onChange={(event) =>
+                          setEditingBinderDraft((current) => ({
+                            ...current,
+                            color: event.target.value,
+                          }))
+                        }
+                      />
+                    </label>
+                  </div>
+                  <div className="binder-editor-cover">
+                    <div className="binder-editor-section-heading">
+                      <strong>Cover artwork</strong>
+                      <span>
+                        Used to identify this binder in your collection.
+                      </span>
+                    </div>
+                    <div className="binder-cover-controls">
+                      <BinderCoverPreview binder={editingBinderDraft} />
+                      <div>
+                        <button
+                          type="button"
+                          className="secondary-button"
+                          onClick={() =>
+                            openBinderCoverPicker(editingBinder.id)
+                          }
+                          disabled={binderBusy}
+                        >
+                          Choose artwork
+                        </button>
+                        {editingBinderDraft.cover_printing_id !== null && (
+                          <button
+                            type="button"
+                            className="text-button"
+                            onClick={() =>
+                              handleClearBinderCover(editingBinder.id)
+                            }
+                            disabled={binderBusy}
+                          >
+                            Remove cover
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                  <div className="binder-edit-actions">
+                    <button
+                      className="primary-button"
+                      disabled={
+                        binderBusy || !editingBinderDraft.name.trim()
+                      }
+                    >
+                      {binderBusy ? "Saving..." : "Save changes"}
+                    </button>
+                    <button
+                      type="button"
+                      className="secondary-button"
+                      onClick={() => {
+                        setEditingBinderId(null);
+                        setEditingBinderDraft(emptyBinderDraft);
+                        setBinderError("");
+                      }}
+                      disabled={binderBusy}
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                </form>
+              </>
+            ) : (
+              <p className="inline-error" role="alert">
+                This binder is no longer available.
+              </p>
+            )}
+            {binderError && (
+              <p className="inline-error" role="alert">
+                {binderError}
+              </p>
+            )}
+            {editingBinderId === null && (
+              <div className="modal-actions">
+                <button
+                  type="button"
+                  className="secondary-button"
+                  onClick={closeBinderManager}
+                  disabled={binderBusy}
+                >
+                  Done
+                </button>
+              </div>
+            )}
+          </section>
+        </div>
+      )}
+
+      {binderCoverPickerOpen && (
+        <div
+          className="modal-backdrop binder-cover-backdrop"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget && !binderImageLoading) {
+              closeBinderCoverPicker();
+            }
+          }}
+        >
+          <section
+            className="modal binder-image-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="binder-cover-title"
+          >
+            <div className="modal-header">
+              <div>
+                <p className="eyebrow">SELECT A PRINTING</p>
+                <h2 id="binder-cover-title">Choose cover artwork</h2>
+              </div>
+              <button
+                type="button"
+                className="modal-close"
+                aria-label="Close"
+                onClick={closeBinderCoverPicker}
+                disabled={binderImageLoading}
+              >
+                ×
+              </button>
+            </div>
+            <p className="import-description">
+              Search for a card, then choose its printing. The binder uses
+              Scryfall&apos;s artwork-only crop rather than the full card frame.
+            </p>
+            {!binderImageCard && (
+              <>
+                <form
+                  className="binder-image-search"
+                  onSubmit={handleSearchBinderImage}
+                >
+                  <label className="search-field">
+                    <span aria-hidden="true" className="search-icon">⌕</span>
+                    <input
+                      autoFocus
+                      aria-label="Search cards for binder cover"
+                      placeholder="Search card names..."
+                      value={binderImageQuery}
+                      onChange={(event) =>
+                        setBinderImageQuery(event.target.value)
+                      }
+                    />
+                  </label>
+                  <button
+                    className="primary-button"
+                    disabled={binderImageLoading}
+                  >
+                    {binderImageLoading ? "Searching..." : "Search"}
+                  </button>
+                </form>
+                {binderImageResults.length > 0 && (
+                  <div className="binder-image-results">
+                    {binderImageResults.map((card) => (
+                      <button
+                        type="button"
+                        className="binder-image-result"
+                        key={`${card.oracle_id ?? card.id}-${card.id}`}
+                        onClick={() =>
+                          void handleSelectBinderImageCard(card)
+                        }
+                        disabled={binderImageLoading}
+                      >
+                        <strong>{card.name}</strong>
+                        <span>
+                          {card.set_name} · {card.set.toUpperCase()}
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </>
+            )}
+            {binderImageCard && (
+              <div className="binder-image-printings-view">
+                <button
+                  type="button"
+                  className="text-button"
+                  onClick={returnToBinderImageResults}
+                  disabled={binderImageLoading}
+                >
+                  ← Back to search results
+                </button>
+                <div className="binder-image-printings-heading">
+                  <h3>{binderImageCard.name}</h3>
+                  <span>
+                    {binderImageLoading
+                      ? "Loading printings..."
+                      : `${binderImagePrintings.length} printings`}
+                  </span>
+                </div>
+                {!binderImageLoading &&
+                  binderImagePrintings.length === 0 &&
+                  !binderImageError && (
+                    <p className="search-status">
+                      No printings were found in the local catalog.
+                    </p>
+                  )}
+                <div className="binder-printing-grid">
+                  {binderImagePrintings.map((printing) => {
+                    const artCrop = printing.image_uris?.art_crop;
+                    return (
+                      <button
+                        type="button"
+                        className="binder-printing-choice"
+                        key={printing.printing_id ?? printing.id}
+                        onClick={() => handleChooseBinderCover(printing)}
+                        disabled={
+                          binderImageLoading ||
+                          printing.printing_id === undefined ||
+                          !artCrop
+                        }
+                      >
+                        <span className="binder-printing-art">
+                          {artCrop ? (
+                            <Image
+                              src={artCrop}
+                              alt=""
+                              width={488}
+                              height={220}
+                              unoptimized
+                            />
+                          ) : (
+                            <span>No artwork crop</span>
+                          )}
+                        </span>
+                        <span className="binder-printing-meta">
+                          <strong>{printing.set_name}</strong>
+                          <small>
+                            {printing.set.toUpperCase()} · #
+                            {printing.collector_number}
+                            {printing.released_at
+                              ? ` · ${printing.released_at.slice(0, 4)}`
+                              : ""}
+                          </small>
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+            {binderImageError && (
+              <p className="inline-error" role="alert">
+                {binderImageError}
+              </p>
+            )}
+            <div className="modal-actions">
+              <button
+                type="button"
+                className="secondary-button"
+                onClick={closeBinderCoverPicker}
+                disabled={binderImageLoading}
+              >
+                Cancel
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
 
       {isImportOpen && (
         <div
@@ -1548,6 +3270,21 @@ export default function CollectionManager({
                   </select>
                 </label>
               </div>
+              <label className="field">
+                <span>Binder</span>
+                <select
+                  value={bulkBinder}
+                  onChange={(event) => setBulkBinder(event.target.value)}
+                >
+                  <option value="unchanged">Leave unchanged</option>
+                  <option value="unassigned">Unassigned</option>
+                  {binders.map((binder) => (
+                    <option key={binder.id} value={`binder:${binder.id}`}>
+                      {binder.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
               {bulkError && <p className="inline-error">{bulkError}</p>}
               <div className="modal-actions">
                 <button
@@ -1759,6 +3496,23 @@ export default function CollectionManager({
                   <div className="search-results printing-results">
                     {visiblePrintings.map((printing) => {
                       const thumbnail = getScryfallThumbnail(printing);
+                      const printingPrices = [
+                        {
+                          finish: "nonfoil",
+                          price: getScryfallCurrentEuroPrice(printing, "Nonfoil"),
+                        },
+                        {
+                          finish: "foil",
+                          price: getScryfallCurrentEuroPrice(printing, "Foil"),
+                        },
+                        {
+                          finish: "etched",
+                          price: getScryfallCurrentEuroPrice(printing, "Etched"),
+                        },
+                      ].filter(
+                        (entry): entry is { finish: string; price: number } =>
+                          entry.price !== null
+                      );
                       return (
                         <button
                           type="button"
@@ -1794,6 +3548,16 @@ export default function CollectionManager({
                             <small>
                               {printing.finishes?.join(" · ") ?? "Finish unknown"}
                             </small>
+                            {printingPrices.length > 0 && (
+                              <small>
+                                {printingPrices
+                                  .map(
+                                    ({ finish, price }) =>
+                                      `${formatCurrency(price)} ${finish}`
+                                  )
+                                  .join(" · ")}
+                              </small>
+                            )}
                           </span>
                           {printing.id === cardPrintings[0]?.id && (
                             <span className="latest-printing-tag">LATEST</span>
@@ -1836,7 +3600,11 @@ export default function CollectionManager({
                     Change printing
                   </button>
                 </div>
-                <CopyFields draft={addDraft} onChange={setAddDraft} />
+                <CopyFields
+                  draft={addDraft}
+                  onChange={handleAddDraftChange}
+                  binders={binders}
+                />
                 {dialogError && <p className="inline-error">{dialogError}</p>}
                 <div className="modal-actions">
                   <button
@@ -2061,7 +3829,11 @@ export default function CollectionManager({
                           Cancel edit
                         </button>
                       </div>
-                      <CopyFields draft={editDraft} onChange={setEditDraft} />
+                      <CopyFields
+                        draft={editDraft}
+                        onChange={setEditDraft}
+                        binders={binders}
+                      />
                       <button className="primary-button" disabled={busy}>
                         {busy ? "Saving..." : "Save changes"}
                       </button>
@@ -2115,6 +3887,8 @@ export default function CollectionManager({
           </section>
         </div>
       )}
+        </div>
+      </div>
     </main>
   );
 }

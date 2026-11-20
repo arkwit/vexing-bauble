@@ -1,5 +1,6 @@
 #!/bin/zsh
+set -e
 
-source .venv/bin/activate
+source backend/.venv/bin/activate
 
 npm run dev & (cd backend && fastapi run)
